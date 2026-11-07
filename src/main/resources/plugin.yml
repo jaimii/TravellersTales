@@ -1,0 +1,13 @@
+name: TravellersTales
+version: '${version}'
+main: project.kompass.travellersTales.TravellersTales
+description: '${description}'
+api-version: '26.3'
+authors: [ JustJamii ]
+softdepend:
+  - packetevents
+  - DiscordSRV
+permissions:
+  travellerstales.admin:
+    description: Allows managing Wither's Wrath settings and maintenance commands.
+    default: op

@@ -1,0 +1,334 @@
+# ==============================================================================
+#                      TRAVELLERS TALES - CORE CONFIGURATION
+# ==============================================================================
+# All text fields support Adventure MiniMessage formatting (<color>, <gradient>, <bold>, etc.)
+# BossBar Colors:  PINK, BLUE, RED, GREEN, YELLOW, PURPLE, WHITE
+# BossBar Styles:  PROGRESS, NOTCHED_6, NOTCHED_10, NOTCHED_12, NOTCHED_20
+# ==============================================================================
+
+# ==============================================================================
+# WEAPON RESISTANCE SETTINGS (Mace & Spear Reduction)
+# ==============================================================================
+weapon-resistance:
+  enabled: true
+  only-bosses: false
+  damage-multiplier: 0.25
+
+
+# ==============================================================================
+# 1. THE WITHER
+# ==============================================================================
+wither:
+  enabled: true
+  max-health: 1000.0
+  follow-range: 64.0
+  max-combat-distance: 256.0
+  exp-levels-dropped: 200            # Drops 200 levels of EXP
+  spear-mace-damage-multiplier: 0.25
+  animation-mode: DEFAULT
+
+  boss-bar:
+    enabled: true
+    title: "<bold><#8F09CE>ᴛʜᴇ ᴡɪᴛʜᴇʀ</#8F09CE></bold>"
+    phase-2-title: "<bold><#B300B3>ᴛʜᴇ ᴡɪᴛʜᴇʀ</#B300B3></bold>"
+    enraged-title: "<bold><dark_red>ᴛʜᴇ ᴡɪᴛʜᴇʀ <gray>[</gray><red>ᴇɴʀᴀɢᴇᴅ</red><gray>]</gray></dark_red></bold>"
+    color: PURPLE
+    phase-2-color: PINK
+    enraged-color: RED
+    style: NOTCHED_10
+    radius: 144.0
+    darken-sky: true
+    create-fog: false
+    play-boss-music: false
+
+  drop-trophy: true
+  destruction: true
+  homing-skulls: true
+  charge-attack: true
+  minion-spawns: true
+  direct-hit-counter: true
+  wind-dashes: true
+  weather-effects: true
+  require-bad-omen: false
+
+  burst-counter:
+    tier-1-damage: 50.0
+    tier-2-damage: 100.0
+    enrage-damage: 151.0
+
+
+# ==============================================================================
+# 2. THE ENDER DRAGON
+# ==============================================================================
+dragon:
+  enabled: true
+  max-health: 1500.0
+  follow-range: 64.0
+  max-combat-distance: 256.0
+  exp-levels-dropped: 300            # Drops 300 levels of EXP
+
+  boss-bar:
+    enabled: true
+    style: NOTCHED_20
+    radius: 256.0
+    darken-sky: true
+
+  phases:
+    phase-1:
+      name: "<bold><#A855F7>ᴛʜᴇ ᴠᴏɪᴅ ᴅʀᴀɢᴏɴ</#A855F7></bold>"
+      bar-color: PURPLE
+      glow-color: DARK_PURPLE
+      levitation-duration-ticks: 600
+    phase-2:
+      name: "<bold><#EF4444>ᴛʜᴇ ᴄʀɪᴍꜱᴏɴ ᴅʀᴀɢᴏɴ</#EF4444></bold>"
+      bar-color: RED
+      glow-color: RED
+      wither-duration-ticks: 600
+    phase-3:
+      name: "<bold><#EC4899>ᴛʜᴇ ɪᴄʜᴏʀ ᴅʀᴀɢᴏɴ</#EC4899></bold>"
+      bar-color: PINK
+      glow-color: LIGHT_PURPLE
+      lifesteal-multiplier: 1.0
+    phase-4:
+      name: "<bold><#581C87>ᴛʜᴇ ᴇɴᴅᴇʀ ᴅʀᴀɢᴏɴ</#581C87></bold>"
+      bar-color: PURPLE
+      glow-color: DARK_PURPLE
+
+  anti-pearl-farming: true
+  caged-tower-phantoms: true
+  crystal-beacon-particles: true
+  crystal-counter-actionbar: true
+  dragon-particle-trail: true
+  respawn-cinematic: true
+
+
+# ==============================================================================
+# 3. THE WARDEN
+# ==============================================================================
+warden:
+  enabled: true
+  max-health: 1000.0
+  follow-range: 64.0
+  max-combat-distance: 256.0
+  exp-levels-dropped: 100            # Drops 100 levels of EXP
+  grace-period-seconds: 600
+  shrieker-spawn-lock-radius: 32.0
+  sonic-boom-extra-range: 10.0
+
+  boss-bar:
+    enabled: true
+    title: "<bold><#00A8FF>ᴛʜᴇ ᴡᴀʀᴅᴇɴ</#00A8FF></bold>"
+    phase-2-title: "<bold><#0077FF>ᴛʜᴇ ᴡᴀʀᴅᴇɴ <gray>[</gray><aqua>ꜱʏᴍʙɪᴏᴛɪᴄ</aqua><gray>]</gray></#0077FF></bold>"
+    phase-3-title: "<bold><#00E5FF>ᴛʜᴇ ᴡᴀʀᴅᴇɴ <gray>[</gray><blue>ᴜɴʙᴏᴜɴᴅ</blue><gray>]</gray></#00E5FF></bold>"
+    color: BLUE
+    style: NOTCHED_20
+    radius: 128.0
+    darken-sky: true
+
+  phase-1:
+    tendril-interval-ticks: 300
+    tendril-block: POINTED_DRIPSTONE
+    snare-duration-ticks: 40
+
+  phase-2:
+    transition-invuln-ticks: 100
+    darkness-radius: 128.0
+    parasite-name: "<bold><#00A8FF>Sculk Parasite</#00A8FF></bold>"
+    vibration-beacon-interval-ticks: 30
+    vibration-beacon-radius: 20.0
+    seismic-echo-interval-ticks: 400
+    seismic-echo-damage: 10.0
+
+  phase-3:
+    movement-speed: 0.38
+    parry-interval-ticks: 360
+    parry-counter-damage-percent: 0.15
+    parry-stun-ticks: 80
+    parry-punish-damage: 25.0
+
+
+# ==============================================================================
+# 4. THE TRAVELLER
+# ==============================================================================
+traveller:
+  enabled: true
+  display-name: "<bold><gradient:#E5C158:#FFF3A1:#B8860B>ᴛʜᴇ ᴛʀᴀᴠᴇʟʟᴇʀ</gradient></bold>"
+  spawn-announcement: "<bold><#E5C158>An otherworldly presence has just spawned.</#E5C158></bold>"
+  max-health: 250.0
+  movement-speed: 0.28
+  follow-range: 64.0
+  max-combat-distance: 256.0
+  exp-levels-dropped: 50             # Drops 50 levels of EXP
+
+  shield:
+    arrow-damage-reduction: 0.75
+    shield-block-chance: 0.35
+    shield-disable-ticks: 100
+    shield-bash-cooldown-seconds: 3
+    shield-bash-knockback: 1.7
+
+  spawning:
+    require-dragon-killed: true
+    sleepless-days-required: 5
+    afk-timeout-seconds: 120
+    min-surface-sky-light: 10
+
+  boss-bar:
+    enabled: true
+    title: "<bold><gradient:#E5C158:#FFF3A1:#B8860B>ᴛʜᴇ ᴛʀᴀᴠᴇʟʟᴇʀ</gradient></bold>"
+    color: YELLOW
+    style: NOTCHED_6
+    radius: 64.0
+    darken-sky: true
+
+  skills:
+    teleport-cooldown-seconds: 15
+    teleport-proc-chance: 0.80
+    skull-barrage-cooldown-seconds: 14
+    swirl-attack-cooldown-seconds: 10
+
+
+# ==============================================================================
+# 5. THE GIANT
+# ==============================================================================
+giant:
+  enabled: true
+  display-name: "<bold><green>Giant</green></bold>"
+  max-health: 500.0
+  attack-damage: 15.0
+  movement-speed: 0.50
+  follow-range: 64.0
+  max-combat-distance: 256.0
+  reinforcements-chance: 0.38
+  exp-levels-dropped: 50             # Drops 50 levels of EXP
+
+  spawning:
+    safe-zone-half-size: 250.0
+    pre-dragon-interval-days: 5
+    post-dragon-cooldown-days: 3
+
+  boss-bar:
+    enabled: true
+    title: "<bold><green>Giant</green></bold>"
+    color: GREEN
+    style: PROGRESS
+    radius: 64.0
+    darken-sky: true
+
+  skills:
+    jump-interval-ticks: 220
+    earthquake-radius: 8.0
+    earthquake-damage: 4.0
+    death-zombies-min: 6
+    death-zombies-max: 12
+
+
+# ==============================================================================
+# 6. DREADNOUGHT GOLEM
+# ==============================================================================
+dreadnought:
+  enabled: true
+  display-name: "<bold><gold>Dreadnought</gold> <green>Golem</green></bold>"
+  max-health: 800.0
+  attack-damage: 15.0
+  armor: 10.0
+  movement-speed: 0.40
+  follow-range: 64.0
+  max-combat-distance: 256.0
+  knockback-resistance: 1.0
+  attack-cadence-ticks: 12
+  exp-levels-dropped: 0
+
+  boss-bar:
+    enabled: true
+    title: "<bold><gold>Dreadnought</gold> <green>Golem</green></bold>"
+    color: GREEN
+    style: PROGRESS
+    radius: 64.0
+    darken-sky: false
+
+  skills:
+    heal-aura-radius: 16.0
+    smash-cooldown-seconds: 20
+    smash-grab-range: 40.0
+    smash-primary-damage: 50.0
+    smash-aoe-damage: 10.0
+    smash-aoe-radius: 8.0
+    bash-cooldown-seconds: 10
+    bash-damage: 40.0
+    bash-knockback-strength: 2.8
+
+
+# ==============================================================================
+# 7. THE WORLD SLIME
+# ==============================================================================
+world-slime:
+  enabled: true
+  display-name: "<bold><gradient:#2ECC71:#A3E635>ᴛʜᴇ ᴡᴏʀʟᴅ ꜱʟɪᴍᴇ</gradient></bold>"
+  split-display-name: "<bold><gradient:#2ECC71:#A3E635>ᴡᴏʀʟᴅ ꜱʟɪᴍᴇ ᴛᴡɪɴ</gradient></bold>"
+  phase-1-health: 300.0
+  phase-2-health: 100.0
+  phase-1-size: 9
+  phase-2-size: 5
+  follow-range: 64.0
+  max-combat-distance: 256.0
+  exp-levels-dropped: 50             # Drops 50 levels of EXP
+  debuff-duration-ticks: 600
+  slam-interval-ticks: 200
+  slam-radius: 8.0
+  slam-damage-phase-1: 4.0
+  slam-damage-phase-2: 2.0
+
+  boss-bar:
+    enabled: true
+    title: "<bold><gradient:#2ECC71:#A3E635>ᴛʜᴇ ᴡᴏʀʟᴅ ꜱʟɪᴍᴇ</gradient></bold>"
+    phase-2-title: "<bold><gradient:#2ECC71:#A3E635>ᴛʜᴇ ᴡᴏʀʟᴅ ꜱʟɪᴍᴇ <gray>[</gray><green>ꜱᴘʟɪᴛ</green><gray>]</gray></gradient></bold>"
+    color: GREEN
+    style: NOTCHED_10
+    radius: 64.0
+    darken-sky: false
+
+
+# ==============================================================================
+# 8. THE MAGMA CORE
+# ==============================================================================
+magma-core:
+  enabled: true
+  display-name: "<bold><gradient:#FF4500:#FF8C00>ᴛʜᴇ ᴍᴀɢᴍᴀ ᴄᴏʀᴇ</gradient></bold>"
+  split-display-name: "<bold><gradient:#FF4500:#FF8C00>ᴍᴀɢᴍᴀ ᴄᴏʀᴇ ᴛᴡɪɴ</gradient></bold>"
+  phase-1-health: 300.0
+  phase-2-health: 100.0
+  phase-1-size: 9
+  phase-2-size: 5
+  follow-range: 64.0
+  max-combat-distance: 256.0
+  exp-levels-dropped: 50             # Drops 50 levels of EXP
+  debuff-duration-ticks: 600
+  slam-interval-ticks: 200
+  slam-radius: 8.0
+  slam-damage-phase-1: 8.0
+  slam-damage-phase-2: 4.0
+
+  boss-bar:
+    enabled: true
+    title: "<bold><gradient:#FF4500:#FF8C00>ᴛʜᴇ ᴍᴀɢᴍᴀ ᴄᴏʀᴇ</gradient></bold>"
+    phase-2-title: "<bold><gradient:#FF4500:#FF8C00>ᴛʜᴇ ᴍᴀɢᴍᴀ ᴄᴏʀᴇ <gray>[</gray><red>ꜱᴘʟɪᴛ</red><gray>]</gray></gradient></bold>"
+    color: RED
+    style: NOTCHED_10
+    radius: 64.0
+    darken-sky: false
+
+
+# ==============================================================================
+# 9. HEROBRINE
+# ==============================================================================
+herobrine:
+  enabled: true
+  max-health: 1500.0
+  phase-2-threshold: 1000.0
+  phase-3-threshold: 500.0
+  movement-speed: 0.35
+  follow-range: 64.0
+  max-combat-distance: 256.0
+  exp-levels-dropped: 500            # Herobrine drops 500 levels of EXP
+  steve-minion-exp-levels-dropped: 10 # Each Steve minion drops 10 levels of EXP
