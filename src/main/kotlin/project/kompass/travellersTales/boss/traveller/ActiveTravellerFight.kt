@@ -58,6 +58,10 @@ class ActiveTravellerFight(
 
     private var orbitAngle: Double = 0.0
 
+    // Pathfinding throttle state
+    private var pathfindingCooldownTicks: Int = 0
+    private var lastStalkTargetLoc: Location? = null
+
     // Shield State Tracking
     var shieldDisabledUntilTick: Int = 0
         private set
@@ -107,7 +111,7 @@ class ActiveTravellerFight(
         entity.getAttribute(Attribute.MAX_HEALTH)?.baseValue = config.maxHealth
         entity.health = config.maxHealth
         entity.getAttribute(Attribute.MOVEMENT_SPEED)?.baseValue = config.movementSpeed
-        entity.getAttribute(Attribute.FOLLOW_RANGE)?.baseValue = config.followRange
+        entity.getAttribute(Attribute.FOLLOW_RANGE)?.baseValue = config.followRange // 64.0
         entity.getAttribute(Attribute.KNOCKBACK_RESISTANCE)?.baseValue = 0.6
     }
 
@@ -174,7 +178,7 @@ class ActiveTravellerFight(
             }
         }
 
-        // 20-Tick (1s) Combat & Escape Detection Loop
+        // 20-Tick (1s) Combat & MaxCombatDistance / Escape Detection Loop
         runTimer(20L, 20L) {
             if (!entity.isValid || entity.isDead) return@runTimer
 
@@ -226,11 +230,25 @@ class ActiveTravellerFight(
     }
 
     // ========================================================================
-    // STALKING & PROVOCATION
+    // STALKING & PROVOCATION (THROTTLED PATHFINDING)
     // ========================================================================
 
     private fun tickStalkingMovement(player: Player) {
         val dist = entity.location.distance(player.location)
+
+        // Throttle pathfinding: update at most every 15 ticks unless player moved > 4 blocks
+        if (pathfindingCooldownTicks > 0) {
+            pathfindingCooldownTicks--
+            val lastLoc = lastStalkTargetLoc
+            if (lastLoc == null || player.location.distanceSquared(lastLoc) > 16.0) {
+                pathfindingCooldownTicks = 0
+            } else {
+                return
+            }
+        }
+
+        pathfindingCooldownTicks = 15
+        lastStalkTargetLoc = player.location.clone()
 
         when {
             dist < 11.0 -> {

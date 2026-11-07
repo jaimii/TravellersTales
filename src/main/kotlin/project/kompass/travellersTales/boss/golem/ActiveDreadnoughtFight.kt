@@ -16,7 +16,6 @@ import project.kompass.travellersTales.registry.MobKeys
 import project.kompass.travellersTales.util.mm
 import kotlin.math.cos
 import kotlin.math.sin
-import kotlin.math.sqrt
 
 class ActiveDreadnoughtFight(
     private val plugin: TravellersTales,
@@ -33,6 +32,10 @@ class ActiveDreadnoughtFight(
     private var lastSmashMillis: Long = 0L
     private var lastBashMillis: Long = 0L
     private var fastAttackCooldownTicks: Int = 0
+
+    // Performance target cache
+    private var cachedTarget: LivingEntity? = null
+    private var targetScanCooldownTicks: Int = 0
 
     // Beacon Energy Particle Palette
     private val beaconCyanGold = Particle.DustTransition(
@@ -82,7 +85,7 @@ class ActiveDreadnoughtFight(
     }
 
     // ========================================================================
-    // 7. FANCY BEACON SPAWN ANIMATION
+    // BEACON SPAWN ANIMATION
     // ========================================================================
 
     private fun playBeaconSpawnAnimation() {
@@ -129,38 +132,58 @@ class ActiveDreadnoughtFight(
     // ========================================================================
 
     private fun scheduleCoreLoops() {
-        // 1-Tick Loop: Clear any accidental Player target & run Faster Attack Speed Cadence
+        // 1-Tick Loop: Rapid Attack Cadence with Cached Target System (Optimized)
         runTimer(1L, 1L) {
             if (!golem.isValid || golem.isDead || isDying || isPerformingSmash) return@runTimer
 
+            // Always disallow targeting players
             if (golem.target is Player) {
                 golem.target = null
             }
 
-            if (fastAttackCooldownTicks > 0) {
-                fastAttackCooldownTicks--
-                return@runTimer
+            if (fastAttackCooldownTicks > 0) fastAttackCooldownTicks--
+
+            // Validate existing cached target
+            val target = cachedTarget
+            if (target == null || !target.isValid || target.isDead || !isHostileEnemy(target) ||
+                target.location.distanceSquared(golem.location) > config.followRange * config.followRange
+            ) {
+                cachedTarget = null
             }
 
-            val target = resolveHostileTarget() ?: return@runTimer
-            val distSq = golem.location.distanceSquared(target.location)
-            if (distSq <= 12.25) { // Within 3.5 blocks melee reach
-                fastAttackCooldownTicks = config.attackCadenceTicks
+            // Only perform expensive nearby entity lookup every 15 ticks when a new target is needed
+            if (cachedTarget == null) {
+                if (targetScanCooldownTicks > 0) {
+                    targetScanCooldownTicks--
+                } else {
+                    targetScanCooldownTicks = 15
+                    cachedTarget = resolveHostileTarget()
+                    if (cachedTarget != null) {
+                        golem.target = cachedTarget
+                    }
+                }
+            }
+
+            // Execute rapid melee cadence against cached target
+            val current = cachedTarget ?: return@runTimer
+            val distSq = golem.location.distanceSquared(current.location)
+            if (distSq <= 12.25 && fastAttackCooldownTicks <= 0) { // Within 3.5 blocks reach
+                fastAttackCooldownTicks = config.attackCadenceTicks // 12 ticks
                 golem.swingMainHand()
-                golem.attack(target)
+                golem.attack(current)
             }
         }
 
-        // 20-Tick (1s) Loop: MaxCombatDistance (256.0) & SmashMech Trigger (50% chance when target within 40b)
+        // 20-Tick (1s) Loop: MaxCombatDistance (256.0) & SmashMech Trigger
         runTimer(20L, 20L) {
             if (!golem.isValid || golem.isDead || isDying || isPerformingSmash) return@runTimer
 
-            // Enforce MaxCombatDistance (256.0 blocks)
             if (golem.location.distanceSquared(patrolAnchor) > config.maxCombatDistanceSquared) {
                 golem.teleport(patrolAnchor)
             }
 
-            val target = resolveHostileTarget() ?: return@runTimer
+            val target = cachedTarget ?: resolveHostileTarget() ?: return@runTimer
+            cachedTarget = target
             golem.target = target
 
             val now = System.currentTimeMillis()
@@ -182,7 +205,6 @@ class ActiveDreadnoughtFight(
             world.spawnParticle(Particle.DUST_COLOR_TRANSITION, coreLoc, 6, 0.3, 0.3, 0.3, 0.0, beaconCyanGold)
             world.spawnParticle(Particle.END_ROD, coreLoc, 2, 0.25, 0.25, 0.25, 0.01)
 
-            // Ensure self-regeneration stays active
             if (!golem.hasPotionEffect(PotionEffectType.REGENERATION)) {
                 golem.addPotionEffect(
                     PotionEffect(PotionEffectType.REGENERATION, PotionEffect.INFINITE_DURATION, 0, true, false, false)
@@ -206,20 +228,18 @@ class ActiveDreadnoughtFight(
     }
 
     // ========================================================================
-    // 1 & 2. IMPROVED GRAB-AND-SLAM ATTACK (SmashMech)
+    // GRAB-AND-SLAM ATTACK (SmashMech)
     // ========================================================================
 
     private fun triggerGrabAndSlamAttack(target: LivingEntity) {
         isPerformingSmash = true
 
-        // If target is further than 5 blocks away, leap to close the gap first
         val dist = golem.location.distance(target.location)
         if (dist > 5.0) {
             val jumpDir = target.location.toVector().subtract(golem.location.toVector()).setY(0.0).normalize()
             golem.velocity = jumpDir.multiply((dist * 0.14).coerceAtMost(1.6)).setY(0.65)
         }
 
-        // Start the 26-tick Overhead Grab & Lift, then Slam Down
         val grabDelay = if (dist > 5.0) 12L else 1L
         runLater(grabDelay) {
             if (!golem.isValid || isDying || !target.isValid || target.isDead) {
@@ -227,7 +247,6 @@ class ActiveDreadnoughtFight(
                 return@runLater
             }
 
-            // Launch Golem upward while hoisting the target mob above its head
             golem.swingMainHand()
             golem.velocity = Vector(0.0, 1.0, 0.0)
             world.playSound(golem.location, Sound.ENTITY_IRON_GOLEM_ATTACK, SoundCategory.NEUTRAL, 2.0f, 0.6f)
@@ -243,7 +262,6 @@ class ActiveDreadnoughtFight(
                     return@runTimer
                 }
 
-                // Ticks 1..22: Hold the target locked overhead while crackling with Beacon energy
                 if (holdTick <= 22 && target.isValid && !target.isDead) {
                     val overheadLoc = golem.location.clone().add(0.0, 3.1, 0.0)
                     overheadLoc.yaw = target.location.yaw
@@ -255,12 +273,10 @@ class ActiveDreadnoughtFight(
                     world.spawnParticle(Particle.DUST_COLOR_TRANSITION, overheadLoc, 4, 0.3, 0.3, 0.3, 0.0, beaconCyanGold)
                 }
 
-                // Tick 20: Drive straight downward toward the ground
                 if (holdTick == 20) {
                     golem.velocity = Vector(0.0, -1.6, 0.0)
                 }
 
-                // Tick 26: Execute the Ground Slam Impact!
                 if (holdTick >= 26) {
                     holdTask?.cancel()
                     executeSlamImpact(target)
@@ -279,7 +295,6 @@ class ActiveDreadnoughtFight(
         val groundBlockData = slamOrigin.clone().subtract(0.0, 1.0, 0.0).block.type
             .takeIf { it.isSolid }?.createBlockData() ?: Material.DIRT.createBlockData()
 
-        // Slam primary grabbed target onto the ground in front of the Golem and deal 50.0 damage
         val pierceSource = DamageSource.builder(DamageType.SONIC_BOOM)
             .withCausingEntity(golem)
             .withDirectEntity(golem)
@@ -291,18 +306,16 @@ class ActiveDreadnoughtFight(
             grabbedTarget.velocity = Vector(0.0, 0.45, 0.0)
         }
 
-        // Upgraded Slam Sounds & Particles
         golem.swingMainHand()
         world.playSound(slamOrigin, Sound.ITEM_MACE_SMASH_GROUND_HEAVY, SoundCategory.NEUTRAL, 3.0f, 0.7f)
         world.playSound(slamOrigin, Sound.ENTITY_GENERIC_EXPLODE, SoundCategory.NEUTRAL, 2.5f, 0.8f)
         world.playSound(slamOrigin, Sound.ENTITY_IRON_GOLEM_HURT, SoundCategory.NEUTRAL, 2.0f, 0.5f)
 
         world.spawnParticle(Particle.EXPLOSION_EMITTER, slamOrigin, 1)
-        world.spawnParticle(Particle.GUST_EMITTER_LARGE, slamOrigin.clone().add(0.0, 0.5, 0.0), 3, 1.2, 0.2, 1.2, 0.0)
+        world.spawnParticle(Particle.GUST_EMITTER_LARGE, slamOrigin.clone().add(0.0, 0.4, 0.0), 3, 1.2, 0.2, 1.2, 0.0)
         world.spawnParticle(Particle.BLOCK, slamOrigin.clone().add(0.0, 0.8, 0.0), 200, 2.0, 0.5, 2.0, 0.15, groundBlockData)
         world.spawnParticle(Particle.DUST_PLUME, slamOrigin.clone().add(0.0, 0.3, 0.0), 80, 2.5, 0.3, 2.5, 0.06)
 
-        // Expanding 8-Block Beacon & Earth Shockwave Rings
         val maxR = config.smashAoeRadius
         for (wave in 1..4) {
             val r = (maxR / 4.0) * wave
@@ -319,7 +332,7 @@ class ActiveDreadnoughtFight(
             }
         }
 
-        // 2. Hostile-Only AoE Damage (10.0 armor-ignoring) & Upward Throw within 8 blocks
+        // Hostile-Only AoE Damage (10.0 armor-ignoring) & Upward Throw within 8 blocks
         val radiusSq = maxR * maxR
         slamOrigin.getNearbyLivingEntities(maxR, 5.0, maxR).forEach { entity ->
             if (entity == golem || entity == grabbedTarget) return@forEach
@@ -328,7 +341,7 @@ class ActiveDreadnoughtFight(
             val dx = entity.location.x - slamOrigin.x
             val dz = entity.location.z - slamOrigin.z
             if ((dx * dx + dz * dz) <= radiusSq) {
-                entity.damage(config.smashAoeDamage, pierceSource) // 10.0 armor-ignoring damage
+                entity.damage(config.smashAoeDamage, pierceSource)
                 val pushDir = entity.location.toVector().subtract(slamOrigin.toVector()).setY(0.0)
                 if (pushDir.lengthSquared() > 1e-4) pushDir.normalize()
                 entity.velocity = pushDir.multiply(1.3).setY(1.15)
@@ -337,7 +350,7 @@ class ActiveDreadnoughtFight(
     }
 
     // ========================================================================
-    // 3. DREADNOUGHT BASH (~onAttack: 20 Hearts Damage + Great Knockback)
+    // DREADNOUGHT BASH (20 Hearts Damage + Great Knockback)
     // ========================================================================
 
     fun onMeleeAttack(target: LivingEntity, event: org.bukkit.event.entity.EntityDamageByEntityEvent) {
@@ -350,14 +363,13 @@ class ActiveDreadnoughtFight(
         if ((now - lastBashMillis) < config.bashCooldownMillis) return
         lastBashMillis = now
 
-        // Override damage to 20 hearts (40.0 HP)
+        // 20 hearts (40.0 HP) damage
         event.damage = config.bashDamage
 
         val tLoc = target.location.add(0.0, 1.0, 0.0)
         world.playSound(tLoc, Sound.ENTITY_PLAYER_ATTACK_CRIT, SoundCategory.NEUTRAL, 2.0f, 1.0f)
         world.playSound(tLoc, Sound.ITEM_MACE_SMASH_GROUND_HEAVY, SoundCategory.NEUTRAL, 1.5f, 1.0f)
 
-        // Gust & Beacon Spark particles with 5-tick repeat
         listOf(0L, 5L).forEach { delay ->
             runLater(delay) {
                 if (!target.isValid) return@runLater
@@ -368,10 +380,8 @@ class ActiveDreadnoughtFight(
             }
         }
 
-        // Apply Slowness 7 (Amplifier 6) for 200 ticks
         target.addPotionEffect(PotionEffect(PotionEffectType.SLOWNESS, 200, 6, false, true, true))
 
-        // Push target & nearby hostiles away with great knockback
         val bashDir = target.location.toVector().subtract(golem.location.toVector()).setY(0.0)
         if (bashDir.lengthSquared() > 1e-4) bashDir.normalize() else bashDir.setX(1.0)
 
@@ -383,7 +393,7 @@ class ActiveDreadnoughtFight(
     }
 
     // ========================================================================
-    // 7. FANCY BEACON DEATH ANIMATION
+    // BEACON DEATH ANIMATION
     // ========================================================================
 
     fun triggerBeaconDeathAnimation() {
@@ -403,7 +413,6 @@ class ActiveDreadnoughtFight(
 
         world.playSound(coreLoc, Sound.BLOCK_BEACON_DEACTIVATE, SoundCategory.NEUTRAL, 2.5f, 1.0f)
 
-        // 40-Tick (2s) Beacon Core Deactivation & Implosion
         var tick = 0
         var deathTask: BukkitTask? = null
         deathTask = Bukkit.getScheduler().runTaskTimer(plugin, Runnable {
@@ -429,7 +438,6 @@ class ActiveDreadnoughtFight(
                 world.playSound(currentCore, Sound.ENTITY_IRON_GOLEM_HURT, SoundCategory.NEUTRAL, 2.0f, pitch)
             }
 
-            // Climax at tick 40: Beacon Shatter + Drop 1x Beacon
             if (tick == 40) {
                 deathTask?.cancel()
                 detonateBeaconCoreClimax(currentCore)
@@ -463,9 +471,6 @@ class ActiveDreadnoughtFight(
     // HOSTILE TARGETING & CLEANUP HELPERS
     // ========================================================================
 
-    /**
-     * Strictly targets only hostile enemies (ignores players, animals, villagers, pets, and golems).
-     */
     fun isHostileEnemy(entity: LivingEntity): Boolean {
         if (entity == golem) return false
         if (entity is Player || entity is AbstractVillager || entity is Golem || entity is Animals || entity is Allay) {

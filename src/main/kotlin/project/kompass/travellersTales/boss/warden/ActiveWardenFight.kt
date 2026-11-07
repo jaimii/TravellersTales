@@ -116,7 +116,7 @@ class ActiveWardenFight(
         warden.customName(config.bossBar.title.mm())
         warden.isCustomNameVisible = true
 
-        // Allow chunk unloading to despawn the Warden via EntitiesUnloadEvent
+        // Allow chunk unloading to despawn the Warden cleanly via EntitiesUnloadEvent
         warden.isPersistent = false
         warden.removeWhenFarAway = true
 
@@ -154,23 +154,30 @@ class ActiveWardenFight(
             val dist = warden.location.distance(target.location)
             val maxBoomRange = 15.0 + config.sonicBoomExtraRange // 25.0 blocks
 
-            // If target is in the +10 extended Sonic Boom range (15..25 blocks) where vanilla AI won't fire
+            // Extended Sonic Boom range (15..25 blocks) where vanilla AI won't fire
             if (dist in 15.0..maxBoomRange && extendedBoomCooldownTicks <= 0) {
-                extendedBoomCooldownTicks = 100
+                extendedBoomCooldownTicks = 100 // 5s cooldown
                 triggerExtendedSonicBoomWindup(target)
                 return@runTimer
             }
 
-            // Check if target is unreachable by pathfinding and cannot be sonic boomed
-            val path = warden.pathfinder.findPath(target.location)
-            val cantReachMelee = path == null || (dist > 4.5 && (System.currentTimeMillis() - lastCombatTimestamp) > 6000L)
-            val outOfBoomRange = dist > maxBoomRange || (abs(target.location.y - warden.location.y) > 5.0 && path == null)
+            // Optimized Pathfinding Check: Skip full A* calculation if target is in melee reach with direct line-of-sight
+            val cantReachMelee = if (dist <= 4.5 && warden.hasLineOfSight(target)) {
+                false
+            } else if (dist > 4.5 && (System.currentTimeMillis() - lastCombatTimestamp) > 6000L) {
+                val path = warden.pathfinder.findPath(target.location)
+                path == null
+            } else {
+                false
+            }
+
+            val outOfBoomRange = dist > maxBoomRange || (abs(target.location.y - warden.location.y) > 5.0 && !warden.hasLineOfSight(target))
 
             if (cantReachMelee && outOfBoomRange) {
                 unreachableTicks += 20
                 if (unreachableTicks >= 60 && digCooldownTicks <= 0) {
                     unreachableTicks = 0
-                    digCooldownTicks = 200
+                    digCooldownTicks = 200 // 10s cooldown
                     performDigTeleportTo(target)
                 }
             } else {
@@ -263,7 +270,7 @@ class ActiveWardenFight(
         lastCombatTimestamp = System.currentTimeMillis()
         val origin = warden.location.clone().add(0.0, 1.6, 0.0)
         val dir = targetLocation.toVector().subtract(origin.toVector())
-        if (dir.lengthSquared() < 1e-4) return
+        if (dir.lengthSquared() > 1e-4) return
         dir.normalize()
 
         val totalLength = (15.0 + config.sonicBoomExtraRange).toInt()
@@ -355,7 +362,7 @@ class ActiveWardenFight(
     private fun spawnTendrilSnare(target: LivingEntity) {
         val startLoc = warden.location.clone()
         val flatDir = target.location.toVector().subtract(startLoc.toVector()).setY(0.0)
-        if (flatDir.lengthSquared() < 1e-4) return
+        if (flatDir.lengthSquared() > 1e-4) return
         flatDir.normalize()
 
         val blockData = config.tendrilMaterial.createBlockData()
@@ -605,7 +612,6 @@ class ActiveWardenFight(
         plugin.bossBarManager.unregisterEntity(warden)
         purgeTempEntities()
 
-        // Apply 10-minute persistent grace period to killer, summoner, and nearby players
         val participants = HashSet<Player>()
         killer?.let { participants.add(it) }
         summonerId?.let { id -> Bukkit.getPlayer(id)?.let { participants.add(it) } }
@@ -680,7 +686,6 @@ class ActiveWardenFight(
         world.spawnParticle(Particle.SCULK_CHARGE_POP, chestLoc, 120, 2.0, 1.5, 2.0, 0.15)
         world.spawnParticle(Particle.DUST_COLOR_TRANSITION, chestLoc, 180, 2.2, 2.0, 2.2, 0.1, soulCyanTransition)
 
-        // 3D Spherical burst of individual directional souls flying outward
         val goldenAngle = Math.PI * (3.0 - sqrt(5.0))
         val soulCount = 160
         for (i in 0 until soulCount) {
@@ -697,7 +702,6 @@ class ActiveWardenFight(
             }
         }
 
-        // Drop custom loot: 1x Sculk Catalyst, 1x Recovery Compass, 2x Echo Shards
         val drops = listOf(
             ItemStack(Material.SCULK_CATALYST, 1),
             ItemStack(Material.RECOVERY_COMPASS, 1),
@@ -710,7 +714,6 @@ class ActiveWardenFight(
             }
         }
 
-        // Spawn 100 Levels of Experience (30,970 XP)
         ExperienceUtil.spawnLevelOrbs(chestLoc, config.expLevelsDropped, orbCount = 20)
 
         val id = warden.uniqueId

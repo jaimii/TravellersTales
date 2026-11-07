@@ -59,10 +59,10 @@ class ActiveCubeBossFight(
             cube.isPersistent = true
             cube.removeWhenFarAway = false
 
-            // Set health & combat stats AFTER setting size
+            // Set health & combat stats AFTER setting size (since setSize resets vanilla Slime attributes)
             cube.getAttribute(Attribute.MAX_HEALTH)?.baseValue = maxHealth
             cube.health = maxHealth
-            cube.getAttribute(Attribute.FOLLOW_RANGE)?.baseValue = settings.followRange
+            cube.getAttribute(Attribute.FOLLOW_RANGE)?.baseValue = settings.followRange // 64.0
             cube.getAttribute(Attribute.KNOCKBACK_RESISTANCE)?.baseValue = if (currentPhase == 1) 0.75 else 0.45
             cube.getAttribute(Attribute.ATTACK_DAMAGE)?.baseValue = if (currentPhase == 1) 12.0 else 7.0
 
@@ -122,26 +122,36 @@ class ActiveCubeBossFight(
                 if (cube.uniqueId in slammingCubes || !cube.isOnGround) continue
 
                 val target = resolveTarget(cube) ?: continue
-                if (cube.location.distanceSquared(target.location) <= 1024.0) {
+                if (cube.location.distanceSquared(target.location) <= 1024.0) { // Within 32 blocks
                     performSkyHighJumpSlam(cube, target)
                 }
             }
         }
     }
 
+    // ========================================================================
+    // ON ATTACK: OOZING + SLIME MINION (WORLD SLIME) / 30s FIRE + MAGMA MINION (MAGMA CORE)
+    // ========================================================================
+
     fun onBossDealAttack(attackerCube: AbstractCubeMob, victim: LivingEntity) {
         if (type == CubeBossType.WORLD_SLIME) {
+            // Apply Oozing ("slimed") for 30 seconds (600 ticks)
             victim.addPotionEffect(
                 PotionEffect(PotionEffectType.OOZING, settings.debuffDurationTicks, 0, false, true, true)
             )
             world.playSound(victim.location, Sound.ENTITY_SLIME_SQUISH, SoundCategory.HOSTILE, 1.5f, 0.7f)
             spawnNormalMinions(attackerCube.location, count = 1, size = 2)
         } else {
+            // Set on fire for 30 seconds (600 ticks)
             victim.fireTicks = victim.fireTicks.coerceAtLeast(settings.debuffDurationTicks)
             world.playSound(victim.location, Sound.ITEM_FIRECHARGE_USE, SoundCategory.HOSTILE, 1.5f, 0.8f)
             spawnNormalMinions(attackerCube.location, count = 1, size = 2)
         }
     }
+
+    // ========================================================================
+    // SPECIAL ATTACK: SKY-HIGH JUMP & GROUND SLAM
+    // ========================================================================
 
     private fun performSkyHighJumpSlam(cube: AbstractCubeMob, target: LivingEntity) {
         slammingCubes.add(cube.uniqueId)
@@ -152,6 +162,7 @@ class ActiveCubeBossFight(
         world.spawnParticle(Particle.GUST_EMITTER_SMALL, launchOrigin, 3, 1.0, 0.2, 1.0, 0.0)
         world.spawnParticle(type.accentParticle, launchOrigin, 40, 1.2, 0.5, 1.2, 0.1)
 
+        // Launch very high into the air toward target
         val toTarget = target.location.toVector().subtract(launchOrigin.toVector()).setY(0.0)
         if (toTarget.lengthSquared() > 1e-4) toTarget.normalize()
         cube.velocity = Vector(toTarget.x * 0.75, 1.75, toTarget.z * 0.75)
@@ -167,10 +178,12 @@ class ActiveCubeBossFight(
                 return@runTimer
             }
 
+            // Mid-air particles
             val cLoc = cube.location
             world.spawnParticle(type.accentParticle, cLoc, 8, 0.8, 0.4, 0.8, 0.05)
             world.spawnParticle(Particle.DUST_COLOR_TRANSITION, cLoc, 6, 0.8, 0.4, 0.8, 0.0, type.dustTransition)
 
+            // At apex (~22 ticks), steer above target and plunge straight down
             if (airborneTicks == 22 && !hasStartedPlunge) {
                 hasStartedPlunge = true
                 if (target.isValid && target.world == world) {
@@ -183,6 +196,7 @@ class ActiveCubeBossFight(
                 world.playSound(cLoc, Sound.ENTITY_WARDEN_SONIC_CHARGE, SoundCategory.HOSTILE, 2.5f, 1.5f)
             }
 
+            // Detect ground impact after launch
             if (airborneTicks > 10 && cube.isOnGround) {
                 slammingCubes.remove(cube.uniqueId)
                 slamTask?.cancel()
@@ -193,7 +207,7 @@ class ActiveCubeBossFight(
 
     private fun executeGroundSlamImpact(cube: AbstractCubeMob) {
         val origin = cube.location.clone()
-        val radius = settings.slamRadius
+        val radius = settings.slamRadius // 8.0 blocks
         val damage = if (currentPhase == 1) settings.slamDamagePhase1 else settings.slamDamagePhase2
 
         val groundBlockData = if (type == CubeBossType.WORLD_SLIME) {
@@ -202,6 +216,7 @@ class ActiveCubeBossFight(
             Material.MAGMA_BLOCK.createBlockData()
         }
 
+        // Heavy Slam Sounds & Core Particles
         world.playSound(origin, Sound.ITEM_MACE_SMASH_GROUND_HEAVY, SoundCategory.HOSTILE, 3.5f, 0.7f)
         world.playSound(origin, Sound.ENTITY_GENERIC_EXPLODE, SoundCategory.HOSTILE, 2.5f, 0.75f)
         if (type == CubeBossType.WORLD_SLIME) {
@@ -215,8 +230,10 @@ class ActiveCubeBossFight(
         world.spawnParticle(Particle.DUST_PLUME, origin.clone().add(0.0, 0.2, 0.0), 90, 3.0, 0.3, 3.0, 0.06)
         world.spawnParticle(type.accentParticle, origin.clone().add(0.0, 0.8, 0.0), 100, 2.5, 0.8, 2.5, 0.15)
 
+        // Break foliage, turn grass into dirt, and (for Magma Core) ignite the ground
         terraformSlamArea(origin, radius.toInt())
 
+        // Expanding 8-Block Circular Particle Shockwave Rings
         for (wave in 1..4) {
             val r = (radius / 4.0) * wave
             runLater((wave * 2).toLong()) {
@@ -233,6 +250,7 @@ class ActiveCubeBossFight(
             }
         }
 
+        // Unshieldable, Armor-Ignoring Circular AoE Damage + Status Effect
         val radiusSq = radius * radius
         val unblockableSource = DamageSource.builder(DamageType.SONIC_BOOM)
             .withCausingEntity(cube)
@@ -271,6 +289,7 @@ class ActiveCubeBossFight(
             for (z in -radius..radius) {
                 if ((x * x + z * z) > radiusSq) continue
 
+                // Turn Grass Blocks, Mycelium, and Podzol into Dirt
                 for (y in -2..1) {
                     val ground = centerBlock.getRelative(x, y, z)
                     if (ground.type == Material.GRASS_BLOCK ||
@@ -281,6 +300,7 @@ class ActiveCubeBossFight(
                     }
                 }
 
+                // Break foliage & leaves, and set ground on fire for Magma Core
                 for (y in -1..4) {
                     val b = centerBlock.getRelative(x, y, z)
                     if (isBreakableFoliage(b)) {
@@ -317,6 +337,10 @@ class ActiveCubeBossFight(
                 mat == Material.SWEET_BERRY_BUSH
     }
 
+    // ========================================================================
+    // PHASE 1 -> PHASE 2 SPLIT & PHASE 2 TWIN DEATHS
+    // ========================================================================
+
     fun handleCubeDeath(deadCube: AbstractCubeMob) {
         activeCubes.remove(deadCube)
         slammingCubes.remove(deadCube.uniqueId)
@@ -325,6 +349,7 @@ class ActiveCubeBossFight(
         val deathLoc = deadCube.location.clone()
 
         if (currentPhase == 1) {
+            // Transition to Phase 2: Cut into TWO weaker twins with 100 HP each
             currentPhase = 2
             world.playSound(deathLoc, Sound.ENTITY_SLIME_SQUISH, SoundCategory.HOSTILE, 3.0f, 0.5f)
             world.playSound(deathLoc, Sound.ENTITY_ZOMBIE_VILLAGER_CURE, SoundCategory.HOSTILE, 2.0f, 0.8f)
@@ -342,7 +367,7 @@ class ActiveCubeBossFight(
                 val twin = spawnBossCube(
                     location = twinLoc,
                     size = settings.phase2Size,
-                    maxHealth = settings.phase2Health,
+                    maxHealth = settings.phase2Health, // 100.0 HP each
                     nameMiniMessage = settings.splitDisplayName
                 )
                 twin.velocity = offset.clone().normalize().multiply(0.55).setY(0.5)
@@ -352,8 +377,10 @@ class ActiveCubeBossFight(
             return
         }
 
+        // Phase 2 Twin Death: Spawn normal slimes/magma cubes bursting outward
         spawnNormalMinions(deathLoc, count = 5, size = 2)
 
+        // When BOTH Phase 2 twins are dead, drop the Special Boots & configured EXP!
         if (activeCubes.isEmpty()) {
             completeFightAndDropRewards(deathLoc)
         }
@@ -388,6 +415,7 @@ class ActiveCubeBossFight(
             type.dustTransition
         )
 
+        // Drop Special Boss Boots (Bouncy Boots or Magma Core Boots)
         val boots = plugin.cubeBossManager.createSpecialBoots(type)
         world.dropItemNaturally(dropLoc, boots) { item ->
             item.isGlowing = true
@@ -395,6 +423,7 @@ class ActiveCubeBossFight(
             item.velocity = Vector(0.0, 0.35, 0.0)
         }
 
+        // Drop configured EXP (50 Levels)
         ExperienceUtil.spawnLevelOrbs(dropLoc, settings.expLevelsDropped, orbCount = 15)
         plugin.cubeBossManager.unregisterFight(this)
     }

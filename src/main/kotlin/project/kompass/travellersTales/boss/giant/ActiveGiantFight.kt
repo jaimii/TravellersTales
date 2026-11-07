@@ -16,6 +16,7 @@ import project.kompass.travellersTales.registry.MobKeys
 import project.kompass.travellersTales.util.ExperienceUtil
 import project.kompass.travellersTales.util.mm
 import java.util.UUID
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.random.Random
@@ -39,6 +40,7 @@ class ActiveGiantFight(
     private var wasAirborneForSlam: Boolean = false
     private var airborneTicks: Int = 0
     private var meleeCooldownTicks: Int = 0
+    private var lastTrampleBlockLoc: Location? = null
 
     private val bloodDustTransition = Particle.DustTransition(
         Color.fromRGB(165, 5, 5),
@@ -69,6 +71,7 @@ class ActiveGiantFight(
         giant.getAttribute(Attribute.KNOCKBACK_RESISTANCE)?.baseValue = 0.85
         giant.getAttribute(Attribute.SPAWN_REINFORCEMENTS)?.baseValue = config.reinforcementsChance
 
+        // Complete Fall Damage Immunity
         giant.getAttribute(Attribute.SAFE_FALL_DISTANCE)?.baseValue = 1000.0
         giant.getAttribute(Attribute.FALL_DAMAGE_MULTIPLIER)?.baseValue = 0.0
 
@@ -76,6 +79,10 @@ class ActiveGiantFight(
             Bukkit.getPlayer(id)?.let { giant.target = it }
         }
     }
+
+    // ========================================================================
+    // CRAWL OUT OF THE GROUND INTRO ANIMATION
+    // ========================================================================
 
     private fun playCrawlOutAnimation() {
         isCrawlingOut = true
@@ -109,6 +116,7 @@ class ActiveGiantFight(
                 return@runTimer
             }
 
+            // Rise 11.5 blocks over 60 ticks while lurching shoulders left and right
             val progress = tick / 60.0
             val currentY = buriedLoc.y + (11.5 * progress)
             val lurchYaw = surfaceLoc.yaw + (sin(tick * 0.35) * 18.0).toFloat()
@@ -129,12 +137,18 @@ class ActiveGiantFight(
         }
     }
 
+    // ========================================================================
+    // CORE AI & SPECIAL ATTACK LOOPS
+    // ========================================================================
+
     private fun scheduleCoreLoops() {
+        // 1-Tick Loop: Airborne / Ground Landing Detection & Fallback AI
         runTimer(1L, 1L) {
             if (!giant.isValid || giant.isDead || isCrawlingOut || isDying) return@runTimer
 
             if (meleeCooldownTicks > 0) meleeCooldownTicks--
 
+            // Track airborne state for Earthquake Slam on landing
             if (!giant.isOnGround) {
                 airborneTicks++
                 if (airborneTicks >= 8 || giant.velocity.y < -0.35) {
@@ -154,11 +168,13 @@ class ActiveGiantFight(
             }
         }
 
+        // 5-Tick Loop: Break Leaves/Foliage & Turn Grass Blocks into Dirt
         runTimer(5L, 5L) {
             if (!giant.isValid || giant.isDead || isCrawlingOut || isDying) return@runTimer
             tickFoliageAndGrassTrample()
         }
 
+        // Periodic Earthquake Jump Skill (~every 11 seconds)
         runTimer(config.jumpIntervalTicks, config.jumpIntervalTicks) {
             if (!giant.isValid || giant.isDead || isCrawlingOut || isDying) return@runTimer
             if (!giant.isOnGround) return@runTimer
@@ -169,7 +185,7 @@ class ActiveGiantFight(
             }
 
             val target = resolveTarget() ?: return@runTimer
-            if (giant.location.distanceSquared(target.location) <= 900.0) {
+            if (giant.location.distanceSquared(target.location) <= 900.0) { // Within 30 blocks
                 performEarthquakeJump(target)
             }
         }
@@ -204,7 +220,7 @@ class ActiveGiantFight(
             giant.velocity = Vector(moveVec.x, yVel, moveVec.z)
         }
 
-        val vertDist = kotlin.math.abs(tLoc.y - gLoc.y)
+        val vertDist = abs(tLoc.y - gLoc.y)
         if (distSq <= 23.0 && vertDist <= 6.5 && meleeCooldownTicks <= 0) {
             meleeCooldownTicks = 25
             giant.swingMainHand()
@@ -217,11 +233,17 @@ class ActiveGiantFight(
         }
     }
 
-    private fun tickFoliageAndGrassTrample() {
-        val center = giant.location.block
+    // ========================================================================
+    // FOLIAGE TRAMPLE & TERRAFORMING (OPTIMIZED)
+    // ========================================================================
 
-        for (x in -3..3) {
-            for (z in -3..3) {
+    private fun tickFoliageAndGrassTrample() {
+        val currentLoc = giant.location
+        val center = currentLoc.block
+
+        // 1. Trample grass beneath feet into dirt
+        for (x in -2..2) {
+            for (z in -2..2) {
                 for (y in -1..0) {
                     val groundBlock = center.getRelative(x, y, z)
                     if (groundBlock.type == Material.GRASS_BLOCK ||
@@ -231,11 +253,23 @@ class ActiveGiantFight(
                         groundBlock.type = Material.DIRT
                     }
                 }
+            }
+        }
 
-                for (y in 0..12) {
+        // 2. Only scan upper foliage volume if the Giant has moved to a new block
+        val last = lastTrampleBlockLoc
+        if (last != null && last.blockX == center.x && last.blockY == center.y && last.blockZ == center.z) {
+            return
+        }
+        lastTrampleBlockLoc = center.location
+
+        // Crush leaves and foliage in body height
+        for (x in -2..2) {
+            for (z in -2..2) {
+                for (y in 0..10) {
                     val b = center.getRelative(x, y, z)
                     if (isBreakableFoliageOrLeaf(b)) {
-                        world.spawnParticle(Particle.BLOCK, b.location.add(0.5, 0.5, 0.5), 6, 0.2, 0.2, 0.2, b.blockData)
+                        world.spawnParticle(Particle.BLOCK, b.location.add(0.5, 0.5, 0.5), 4, 0.2, 0.2, 0.2, b.blockData)
                         b.breakNaturally()
                     }
                 }
@@ -259,6 +293,10 @@ class ActiveGiantFight(
                 type == Material.MOSS_CARPET ||
                 type == Material.SWEET_BERRY_BUSH
     }
+
+    // ========================================================================
+    // EARTHQUAKE JUMP & GROUND SLAM (2 HEARTS UNBLOCKABLE AOE)
+    // ========================================================================
 
     private fun performEarthquakeJump(target: LivingEntity) {
         val dir = target.location.toVector().subtract(giant.location.toVector()).setY(0.0)
@@ -300,6 +338,7 @@ class ActiveGiantFight(
             }
         }
 
+        // Deal 2 hearts (4.0 HP) of unblockable, armor-ignoring damage in an 8-block circular radius
         val radiusSq = maxRadius * maxRadius
         val unblockableSource = DamageSource.builder(DamageType.SONIC_BOOM)
             .withCausingEntity(giant)
@@ -321,6 +360,10 @@ class ActiveGiantFight(
         }
     }
 
+    // ========================================================================
+    // BLOODY FLESH DEATH ANIMATION & RANDOMIZED ZOMBIE BURST
+    // ========================================================================
+
     fun triggerBloodyDeathAnimation() {
         if (isDying) return
         isDying = true
@@ -341,6 +384,7 @@ class ActiveGiantFight(
 
         world.playSound(giant.location, Sound.ENTITY_ZOMBIE_DEATH, SoundCategory.HOSTILE, 4.0f, 0.5f)
 
+        // 30-Tick (1.5s) Convulsing Blood & Gore Buildup
         var tick = 0
         var deathTask: BukkitTask? = null
         deathTask = Bukkit.getScheduler().runTaskTimer(plugin, Runnable {
@@ -363,6 +407,7 @@ class ActiveGiantFight(
                 world.playSound(bodyLoc, Sound.ENTITY_WARDEN_DIG, SoundCategory.HOSTILE, 3.0f, 0.8f)
             }
 
+            // Climax at tick 30: Violent Flesh Rupture + Zombie Burst + Loot & 50 Levels EXP
             if (tick == 30) {
                 deathTask?.cancel()
                 detonateGoreClimax(giant.location.clone(), bloodBlockData, fleshBlockData, goreBlockData, rottenFleshStack, boneStack)
@@ -396,6 +441,7 @@ class ActiveGiantFight(
 
         spawnZombieBurst(torsoLoc, bloodData)
 
+        // Drops 128 Rotten Flesh & 64 Bones
         val drops = listOf(
             ItemStack(Material.ROTTEN_FLESH, 64),
             ItemStack(Material.ROTTEN_FLESH, 64),
@@ -405,6 +451,7 @@ class ActiveGiantFight(
             world.dropItemNaturally(torsoLoc, stack)
         }
 
+        // Drops configured 50 Levels of Experience (5,345 XP)
         ExperienceUtil.spawnLevelOrbs(torsoLoc, config.expLevelsDropped, orbCount = 15)
 
         val id = giant.uniqueId
@@ -444,6 +491,10 @@ class ActiveGiantFight(
             world.spawnParticle(Particle.BLOCK, origin, 15, 0.4, 0.4, 0.4, 0.1, bloodData)
         }
     }
+
+    // ========================================================================
+    // CLEANUP & HELPERS
+    // ========================================================================
 
     fun onDeath() {
         forceCleanup(killGiant = false)

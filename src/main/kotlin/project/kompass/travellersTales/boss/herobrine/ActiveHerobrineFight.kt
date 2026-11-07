@@ -149,6 +149,7 @@ class ActiveHerobrineFight(
         currentPhase = 1
         currentTarget = firstAttacker ?: resolveSummonerOrNearest()
 
+        // Phase 1 BossBar starts WHITE
         val barSettings = BossBarSettings(
             enabled = true,
             title = "<bold><white>Herobrine</white></bold>",
@@ -199,7 +200,7 @@ class ActiveHerobrineFight(
         mannequin.velocity = Vector(0.0, 0.0, 0.0)
         mannequin.equipment.setItemInMainHand(ItemStack(Material.AIR))
 
-        // Darkness to nearby players until he explodes at tick 75
+        // Darkness to nearby players until explosion at tick 75
         mannequin.location.getNearbyPlayers(96.0).forEach { player ->
             player.addPotionEffect(PotionEffect(PotionEffectType.DARKNESS, 85, 0, false, false, true))
         }
@@ -261,7 +262,7 @@ class ActiveHerobrineFight(
     private fun enterPhase2() {
         if (currentPhase >= 2) return
         currentPhase = 2
-        mannequin.health = config.phase2Threshold
+        mannequin.health = config.phase2Threshold // 1000.0 HP
 
         mannequin.customName("<bold><red>Herobrine</red></bold>".mm())
         plugin.bossBarManager.updateBarAppearance(
@@ -285,7 +286,7 @@ class ActiveHerobrineFight(
     private fun enterPhase3() {
         if (currentPhase >= 3) return
         currentPhase = 3
-        mannequin.health = config.phase3Threshold
+        mannequin.health = config.phase3Threshold // 500.0 HP
 
         mannequin.isGlowing = true
         mannequin.customName("<bold><light_purple>Herobrine</light_purple></bold>".mm())
@@ -664,7 +665,6 @@ class ActiveHerobrineFight(
         val waveRadii = listOf(4.5, 8.5, 12.5)
         waveRadii.forEachIndexed { waveIdx, radius ->
             val telegraphDelay = startDelay + waveIdx * 24L
-            val strikeDelay = telegraphDelay + 12L
 
             runLater(telegraphDelay) {
                 if (isDeadOrRemoved) return@runLater
@@ -679,6 +679,7 @@ class ActiveHerobrineFight(
                     world.spawnParticle(Particle.DUST_COLOR_TRANSITION, pt, 3, 0.1, 0.1, 0.1, 0.0, deepRedTransition)
                 }
 
+                // Strikes lightning exactly 12 ticks after the telegraph warning
                 runLater(12L) {
                     if (isDeadOrRemoved) return@runLater
                     val strikes = 8 + waveIdx * 2

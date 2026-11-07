@@ -141,13 +141,12 @@ class GiantManager(private val plugin: TravellersTales) {
                     continue
                 }
 
-                // 2. Biome & Altitude Check (No High-Altitude mountains, Mushroom Fields, Deep Dark, Oceans, or Rivers)
-                // Does not add player to spawnedPlayersTonight, so it spawns if they leave the biome or on the next night!
+                // 2. Biome & Altitude Check
                 if (!BiomeValidator.isValidGiantBiome(player.location)) {
                     continue
                 }
 
-                // 3. Traveller Conflict Check: Do not spawn Giant if Traveller is due or active
+                // 3. Traveller Conflict Check
                 if (plugin.travellerManager.isPlayerEngagedOrDue(player)) {
                     continue
                 }
@@ -155,12 +154,10 @@ class GiantManager(private val plugin: TravellersTales) {
                 // 4. Pre-Dragon vs Post-Dragon progression check
                 val killedDragon = hasKilledEnderDragon(player)
                 if (!killedDragon) {
-                    // Pre-Dragon: Spawns every 5th night, regardless of kill/death
                     if (currentDay % config.preDragonIntervalDays != 0L) {
                         continue
                     }
                 } else {
-                    // Post-Dragon: Spawns nightly, unless on 3-day kill/death cooldown
                     if (isOnThreeDayCooldown(player)) {
                         continue
                     }
@@ -179,13 +176,12 @@ class GiantManager(private val plugin: TravellersTales) {
     fun findSmartGiantSpawnLocation(playerLoc: Location): Location? {
         val world = playerLoc.world ?: return null
 
-        repeat(30) {
+        repeat(24) {
             val angle = Random.nextDouble(0.0, 2.0 * Math.PI)
             val dist = Random.nextDouble(32.0, 48.0) // At least 32 blocks away
             val x = (playerLoc.x + cos(angle) * dist).toInt()
             val z = (playerLoc.z + sin(angle) * dist).toInt()
 
-            // 500x500 Overworld Safe Zone check
             if (abs(x) <= config.safeZoneHalfSize && abs(z) <= config.safeZoneHalfSize) {
                 return@repeat
             }
@@ -193,7 +189,6 @@ class GiantManager(private val plugin: TravellersTales) {
             val y = world.getHighestBlockYAt(x, z) + 1
             val candidate = Location(world, x + 0.5, y.toDouble(), z + 0.5)
 
-            // Validate candidate biome & altitude
             if (!BiomeValidator.isValidGiantBiome(candidate)) {
                 return@repeat
             }
@@ -210,11 +205,35 @@ class GiantManager(private val plugin: TravellersTales) {
         return null
     }
 
+    /**
+     * Optimized Fast-Exit Clearance Scan:
+     * Tests the base block + 4 ground corners, then tests the 8 outer perimeter corners.
+     * Aborts in ~8 block reads on invalid terrain instead of reading all 637 blocks!
+     */
     private fun hasGiantClearance(loc: Location): Boolean {
         val center = loc.block
+
+        // 1. Footing test: center and 4 ground corners must be solid non-liquid
         val baseBlock = center.getRelative(0, -1, 0)
         if (!baseBlock.type.isSolid || baseBlock.isLiquid) return false
+        val groundCorners = listOf(
+            center.getRelative(-3, -1, -3), center.getRelative(3, -1, -3),
+            center.getRelative(-3, -1, 3), center.getRelative(3, -1, 3)
+        )
+        if (groundCorners.any { !it.type.isSolid || it.isLiquid }) return false
 
+        // 2. Fast-Exit: 8 perimeter corners of the 7x13x7 volume
+        val perimeterCorners = listOf(
+            center.getRelative(-3, 0, -3), center.getRelative(3, 0, -3),
+            center.getRelative(-3, 0, 3), center.getRelative(3, 0, 3),
+            center.getRelative(-3, 12, -3), center.getRelative(3, 12, -3),
+            center.getRelative(-3, 12, 3), center.getRelative(3, 12, 3)
+        )
+        if (perimeterCorners.any { it.isLiquid || (it.type.isSolid && !Tag.LEAVES.isTagged(it.type)) }) {
+            return false
+        }
+
+        // 3. Full interior clearance check
         for (x in -3..3) {
             for (z in -3..3) {
                 for (y in 0..12) {

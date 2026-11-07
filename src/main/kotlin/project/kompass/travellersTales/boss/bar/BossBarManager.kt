@@ -9,6 +9,7 @@ import org.bukkit.entity.Player
 import org.bukkit.event.EventHandler
 import org.bukkit.event.Listener
 import org.bukkit.event.entity.EntityDeathEvent
+import org.bukkit.event.player.PlayerChangedWorldEvent
 import org.bukkit.event.player.PlayerQuitEvent
 import org.bukkit.plugin.java.JavaPlugin
 import project.kompass.travellersTales.util.mm
@@ -36,7 +37,7 @@ class BossBarManager : Listener {
     }
 
     fun createBossBar(boss: LivingEntity, settings: BossBarSettings): BossBar? {
-        // Hide the vanilla BossBar on Withers/EnderDragons so there is no duplicate bar
+        // Hide vanilla boss bar on Withers and Ender Dragons to avoid duplicate bars
         if (boss is Boss) {
             boss.bossBar?.isVisible = false
         }
@@ -111,6 +112,17 @@ class BossBarManager : Listener {
         }
     }
 
+    @EventHandler
+    fun onPlayerChangedWorld(event: PlayerChangedWorldEvent) {
+        val player = event.player
+        activeBars.values.forEach { tracked ->
+            // If the player moved to a world different from this boss, hide the bar immediately
+            if (player.world != tracked.boss.world && tracked.viewers.remove(player.uniqueId)) {
+                player.hideBossBar(tracked.bar)
+            }
+        }
+    }
+
     private fun tick() {
         if (activeBars.isEmpty()) return
 
@@ -138,11 +150,14 @@ class BossBarManager : Listener {
 
     private fun updateBossBarVisibility(tracked: TrackedBossBar) {
         val boss = tracked.boss
+        val bossWorld = boss.world
         val bossLoc = boss.location
         val radiusSq = tracked.settings.radiusSquared
 
         val targetPlayers = HashSet<Player>()
-        for (player in boss.world.players) {
+        for (player in bossWorld.players) {
+            // Defensive world guard prevents cross-world distance measurement crashes
+            if (player.world != bossWorld) continue
             if (player.location.distanceSquared(bossLoc) <= radiusSq) {
                 targetPlayers.add(player)
             }
@@ -154,7 +169,6 @@ class BossBarManager : Listener {
     private fun syncBarPlayers(tracked: TrackedBossBar, targetPlayers: Set<Player>) {
         val targetIds = targetPlayers.mapTo(HashSet(targetPlayers.size)) { it.uniqueId }
 
-        // Remove players who left range or switched worlds
         val iterator = tracked.viewers.iterator()
         while (iterator.hasNext()) {
             val currentId = iterator.next()
@@ -164,7 +178,6 @@ class BossBarManager : Listener {
             }
         }
 
-        // Add players who entered range
         for (target in targetPlayers) {
             if (tracked.viewers.add(target.uniqueId)) {
                 target.showBossBar(tracked.bar)

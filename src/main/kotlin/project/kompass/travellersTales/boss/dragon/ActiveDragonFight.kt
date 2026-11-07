@@ -21,6 +21,8 @@ import project.kompass.travellersTales.boss.bar.BossBarSettings
 import project.kompass.travellersTales.registry.MobKeys
 import project.kompass.travellersTales.util.ExperienceUtil
 import project.kompass.travellersTales.util.mm
+import java.util.UUID
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
 
@@ -235,6 +237,7 @@ class ActiveDragonFight(
         runTimer(20L, 20L) {
             if (!dragon.isValid || inAttackSequence) return@runTimer
 
+            // Enforce MaxCombatDistance (256.0 blocks from portalCenter)
             if (dragon.location.distanceSquared(portalCenter) > config.maxCombatDistanceSquared) {
                 dragon.teleport(portalCenter)
             }
@@ -525,33 +528,53 @@ class ActiveDragonFight(
         }
     }
 
+    // Consolidated 1-task expanding shockwave (eliminates 72 concurrent repeating tasks)
     private fun spawnConcentricShockwaves(center: Location) {
         val shockwavePhase = currentPhase
-        for (i in 0 until 72) {
-            val angle = Math.toRadians(i * 5.0)
-            val dir = Vector(cos(angle), 0.0, sin(angle)).normalize().multiply(0.5)
+        val unblockableSource = DamageSource.builder(DamageType.MOB_ATTACK)
+            .withDirectEntity(dragon)
+            .build()
 
-            var step = 0
-            val loc = center.clone()
-            var task: BukkitTask? = null
-            task = runTimer(1L, 1L) {
-                step++
-                if (step > 60 || !dragon.isValid) {
-                    task?.cancel()
-                    return@runTimer
-                }
-                loc.add(dir)
-                loc.y = (world.getHighestBlockYAt(loc) + 1).toDouble()
+        var step = 0
+        val hitPlayers = HashSet<UUID>()
+        var task: BukkitTask? = null
+        task = runTimer(1L, 1L) {
+            step++
+            if (step > 60 || !dragon.isValid) {
+                task?.cancel()
+                return@runTimer
+            }
+
+            val radius = step * 0.5 // Expands up to 30 blocks
+            val pointCount = (radius * 5.0).toInt().coerceIn(16, 64)
+
+            for (i in 0 until pointCount) {
+                val angle = 2.0 * Math.PI * i / pointCount
+                val x = center.x + cos(angle) * radius
+                val z = center.z + sin(angle) * radius
+                val y = (world.getHighestBlockYAt(x.toInt(), z.toInt()) + 1).toDouble()
+                val pLoc = Location(world, x, y, z)
 
                 world.spawnParticle(
-                    Particle.DUST, loc, 1, 0.2, 0.05, 0.2, 0.0,
+                    Particle.DUST, pLoc, 1, 0.2, 0.05, 0.2, 0.0,
                     shockwavePhase.dustOptions
                 )
-                world.spawnParticle(shockwavePhase.accentParticle, loc, 1, 0.1, 0.05, 0.1, 0.0)
+                if (i % 2 == 0) {
+                    world.spawnParticle(shockwavePhase.accentParticle, pLoc, 1, 0.1, 0.05, 0.1, 0.0)
+                }
+            }
 
-                loc.getNearbyPlayers(1.4).forEach { p ->
-                    if (p.location.y <= loc.y + 1.0) {
-                        p.damage(16.0, DamageSource.builder(DamageType.MOB_ATTACK).withDirectEntity(dragon).build())
+            // Damage grounded players touched by the expanding wave ring
+            center.getNearbyPlayers(radius + 1.5).forEach { p ->
+                if (p.uniqueId in hitPlayers) return@forEach
+                val dx = p.location.x - center.x
+                val dz = p.location.z - center.z
+                val dist = kotlin.math.sqrt(dx * dx + dz * dz)
+                if (abs(dist - radius) <= 1.0) {
+                    val groundY = (world.getHighestBlockYAt(p.location) + 1).toDouble()
+                    if (p.location.y <= groundY + 1.2) {
+                        hitPlayers.add(p.uniqueId)
+                        p.damage(16.0, unblockableSource)
                         onDragonAttackHit(p, 16.0)
                     }
                 }
@@ -666,7 +689,7 @@ class ActiveDragonFight(
             world.spawnParticle(Particle.END_ROD, portalLoc, 4, pDir.x * 0.5, 0.1, pDir.z * 0.5, 0.05)
         }
 
-        // Send the defeat message ONLY to the player who dealt the killing blow
+        // Deliver defeat message ONLY to the player who landed the killing blow
         killer?.sendMessage(
             """
             <gradient:#00b09b:#96c93d><bold>You have freed the end. You are no longer marked.</bold></gradient>

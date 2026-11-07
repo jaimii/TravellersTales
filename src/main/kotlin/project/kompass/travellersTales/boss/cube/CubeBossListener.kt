@@ -78,6 +78,7 @@ class CubeBossListener(
         val entity = event.entity
         val dmgType = event.damageSource.damageType
 
+        // A. Boss Fall Damage Immunity
         if (entity is AbstractCubeMob && dmgType == DamageType.FALL) {
             if (manager.getFightByEntity(entity) != null) {
                 event.isCancelled = true
@@ -85,6 +86,7 @@ class CubeBossListener(
             }
         }
 
+        // B. Player Special Boots Immunities & Bouncy Boots Rebound
         val player = entity as? Player ?: return
         val bootsType = manager.getEquippedSpecialBootsType(player) ?: return
 
@@ -111,9 +113,11 @@ class CubeBossListener(
         }
 
         if (bootsType == CubeBossType.MAGMA_CORE.bootsId) {
+            // Modern DamageType check replaces deprecated DamageCause.HOT_FLOOR
             if (dmgType == DamageType.HOT_FLOOR ||
                 dmgType == DamageType.IN_FIRE ||
-                dmgType == DamageType.ON_FIRE
+                dmgType == DamageType.ON_FIRE ||
+                dmgType == DamageType.CAMPFIRE
             ) {
                 event.isCancelled = true
                 player.fireTicks = 0
@@ -137,7 +141,13 @@ class CubeBossListener(
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     fun onPlayerMoveWithMagmaBoots(event: PlayerMoveEvent) {
-        if (!event.hasChangedPosition()) return
+        // Fast-Exit: Only evaluate blocks if the player has stepped across a full block boundary
+        val from = event.from
+        val to = event.to
+        if (from.blockX == to.blockX && from.blockY == to.blockY && from.blockZ == to.blockZ) {
+            return
+        }
+
         val player = event.player
         if (manager.getEquippedSpecialBootsType(player) != CubeBossType.MAGMA_CORE.bootsId) return
 
@@ -145,7 +155,7 @@ class CubeBossListener(
             player.fireTicks = 0
         }
 
-        val centerBlock = event.to.block
+        val centerBlock = to.block
         val world = player.world
         var convertedAny = false
 
@@ -158,12 +168,12 @@ class CubeBossListener(
                         Material.LAVA -> {
                             b.type = Material.MAGMA_BLOCK
                             convertedAny = true
-                            world.spawnParticle(Particle.LARGE_SMOKE, b.location.add(0.5, 1.0, 0.5), 3, 0.2, 0.1, 0.2, 0.0)
+                            world.spawnParticle(Particle.LARGE_SMOKE, b.location.add(0.5, 1.0, 0.5), 2, 0.2, 0.1, 0.2, 0.0)
                         }
                         Material.WATER, Material.BUBBLE_COLUMN -> {
                             b.type = Material.STONE
                             convertedAny = true
-                            world.spawnParticle(Particle.LARGE_SMOKE, b.location.add(0.5, 1.0, 0.5), 3, 0.2, 0.1, 0.2, 0.0)
+                            world.spawnParticle(Particle.LARGE_SMOKE, b.location.add(0.5, 1.0, 0.5), 2, 0.2, 0.1, 0.2, 0.0)
                         }
                         else -> {}
                     }

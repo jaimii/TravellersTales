@@ -257,7 +257,7 @@ class ActiveWitherFight(
                 world.spawnParticle(Particle.TRIAL_OMEN, wLoc.clone().add(0.0, 1.0, 0.0), 10, 1.0, 1.0, 1.0, 2.0)
             }
 
-            wLoc.getNearbyEntities(80.0, 80.0, 80.0).forEach { ent ->
+            wLoc.getNearbyEntities(config.followRange, config.followRange, config.followRange).forEach { ent ->
                 if (ent is LivingEntity && ent !is Player && ent !is IronGolem && ent !is Villager) {
                     witherTeam?.addEntity(ent)
                 }
