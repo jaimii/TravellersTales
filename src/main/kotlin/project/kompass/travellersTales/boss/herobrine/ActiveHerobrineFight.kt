@@ -37,17 +37,21 @@ class ActiveHerobrineFight(
     val tablistUuid: UUID = UUID.randomUUID()
     lateinit var mannequin: Mannequin
         private set
+    lateinit var mannequinId: UUID
+        private set
 
     private val tasks = mutableListOf<BukkitTask>()
     val activeSteves = mutableListOf<SteveMinionController>()
     private var herobrineTeam: Team? = null
+    private var steveTeam: Team? = null
 
     // Saved world state for Day/Night sky flickering without advancing day count
     private val savedFullTime: Long = world.fullTime
     private val wasAdvanceTime: Boolean = world.getGameRuleValue(GameRules.ADVANCE_TIME)
 
-    // Slam Settings
-    private val slamRadius: Double = 8.0
+    // 3x3 Slam Settings (1.8-block radius from center covers the 3x3 block grid, -1..1 terraform radius)
+    private val slamRadius: Double = 1.8
+    private val slamBlockHalfSize: Int = 1 // -1..1 X and -1..1 Z = exact 3x3 blocks
     private val phase1SlamDamage: Double = 4.0  // 2 hearts unblockable/armor-ignoring
     private val phase2SlamDamage: Double = 8.0  // 4 hearts unblockable/armor-ignoring
     private val phase3SlamDamage: Double = 10.0 // 10 unblockable/armor-ignoring damage
@@ -60,10 +64,13 @@ class ActiveHerobrineFight(
     var isDyingAnimation: Boolean = false
         private set
     private var isSlamming: Boolean = false
+    private var isLevitatingUp: Boolean = false
     private var waitingForStevesToDie: Boolean = false
+    private var floatingSteveWaitTicks: Int = 0
     private var usingRangedStance: Boolean = false
     private var stanceSwitchTicks: Int = 0
     private var attackCooldownTicks: Int = 0
+    private var lastMeleeBlinkMillis: Long = 0L
     private var damageSinceLastSteveWave: Double = 0.0
     private var currentTarget: Player? = null
     var isDeadOrRemoved: Boolean = false
@@ -118,6 +125,7 @@ class ActiveHerobrineFight(
             m.getAttribute(Attribute.SAFE_FALL_DISTANCE)?.baseValue = 1000.0
             m.getAttribute(Attribute.FALL_DAMAGE_MULTIPLIER)?.baseValue = 0.0
         }
+        mannequinId = mannequin.uniqueId
         herobrineTeam?.addEntity(mannequin)
 
         spawnOrigin.getNearbyPlayers(64.0).forEach { player ->
@@ -130,14 +138,161 @@ class ActiveHerobrineFight(
         scheduleCoreLoops()
     }
 
+    fun rebindMannequin(loaded: Mannequin) {
+        val wasUnloaded = !this.mannequin.isValid
+        this.mannequin = loaded
+        herobrineTeam?.addEntity(loaded)
+        plugin.bossBarManager.rebindEntity(loaded)
+        syncPhaseBossBar()
+
+        if (wasUnloaded && !isDyingAnimation && currentPhase > 0 && !waitingForStevesToDie) {
+            isFloatingInvulnerable = false
+            isSlamming = false
+            isLevitatingUp = false
+            loaded.setGravity(true)
+            val groundLoc = loaded.location.clone().apply {
+                y = findArenaGroundY(this, spawnOrigin.y)
+            }
+            loaded.teleport(groundLoc)
+            loaded.equipment.setItemInMainHand(ItemStack(getPhaseSwordMaterial()))
+        }
+    }
+
+    private fun syncPhaseBossBar() {
+        if (!::mannequin.isInitialized || currentPhase <= 0) return
+        val (title, color) = when (currentPhase) {
+            3 -> "<bold><light_purple>Herobrine</light_purple></bold>" to BossBar.Color.PURPLE
+            2 -> "<bold><red>Herobrine</red></bold>" to BossBar.Color.RED
+            else -> "<bold><white>Herobrine</white></bold>" to BossBar.Color.WHITE
+        }
+        val settings = BossBarSettings(
+            enabled = true,
+            title = title,
+            color = color,
+            overlay = BossBar.Overlay.NOTCHED_10,
+            flags = setOf(BossBar.Flag.DARKEN_SCREEN),
+            radius = 96.0
+        )
+        plugin.bossBarManager.createBossBar(mannequin, settings)
+    }
+
+    private fun ensureLiveMannequin(): Boolean {
+        if (mannequin.isValid) return true
+        val live = Bukkit.getEntity(mannequinId) as? Mannequin
+        if (live != null && live.isValid) {
+            rebindMannequin(live)
+            return true
+        }
+        return false
+    }
+
     private fun setupTeam() {
         val sb = Bukkit.getScoreboardManager().mainScoreboard
-        val teamName = "HB_${tablistUuid.toString().take(8)}"
-        sb.getTeam(teamName)?.unregister()
-        herobrineTeam = sb.registerNewTeam(teamName).apply {
+        val prefix = tablistUuid.toString().take(8)
+
+        val hbTeamName = "HB_$prefix"
+        sb.getTeam(hbTeamName)?.unregister()
+        herobrineTeam = sb.registerNewTeam(hbTeamName).apply {
             setAllowFriendlyFire(false)
             color(NamedTextColor.WHITE)
         }
+
+        // Dedicated team for Steve minions with NAME_TAG_VISIBILITY = NEVER so no names render!
+        val steveTeamName = "HBS_$prefix"
+        sb.getTeam(steveTeamName)?.unregister()
+        steveTeam = sb.registerNewTeam(steveTeamName).apply {
+            setAllowFriendlyFire(false)
+            setOption(Team.Option.NAME_TAG_VISIBILITY, Team.OptionStatus.NEVER)
+            color(NamedTextColor.AQUA)
+        }
+    }
+
+    // ========================================================================
+    // SMOOTH GROUND-TO-AIR LEVITATION (WITH RESONATING BELL SOUND)
+    // ========================================================================
+
+    private fun levitateToFloatHeight(heightAboveFloor: Double = 5.2, durationTicks: Int = 25, onComplete: () -> Unit = {}) {
+        isFloatingInvulnerable = true
+        isLevitatingUp = true
+
+        val startLoc = mannequin.location.clone()
+        val floorY = findArenaGroundY(startLoc, spawnOrigin.y)
+        val targetY = (floorY + heightAboveFloor).coerceAtLeast(startLoc.y + 1.5)
+
+        mannequin.setGravity(false)
+        mannequin.velocity = Vector(0.0, 0.0, 0.0)
+        mannequin.equipment.setItemInMainHand(ItemStack(Material.AIR))
+
+        world.playSound(startLoc, Sound.BLOCK_BELL_RESONATE, SoundCategory.HOSTILE, 3.0f, 0.8f)
+        world.playSound(startLoc, Sound.BLOCK_BELL_USE, SoundCategory.HOSTILE, 2.5f, 0.7f)
+        world.playSound(startLoc, Sound.ENTITY_ENDERMAN_TELEPORT, SoundCategory.HOSTILE, 2.0f, 0.6f)
+
+        var step = 0
+        var riseTask: BukkitTask? = null
+        riseTask = runTimer(1L, 1L) {
+            step++
+            if (isDeadOrRemoved || !ensureLiveMannequin() || step > durationTicks) {
+                isLevitatingUp = false
+                riseTask?.cancel()
+                if (!isDeadOrRemoved && mannequin.isValid) {
+                    onComplete()
+                }
+                return@runTimer
+            }
+
+            val progress = step.toDouble() / durationTicks
+            val curY = startLoc.y + (targetY - startLoc.y) * progress
+            val nextLoc = Location(world, startLoc.x, curY, startLoc.z, mannequin.location.yaw, mannequin.location.pitch)
+            mannequin.teleport(nextLoc)
+
+            resolveCombatTarget()?.let { faceLocation(it.eyeLocation) }
+            world.spawnParticle(Particle.DUST, nextLoc.clone().add(0.0, 0.8, 0.0), 6, 0.4, 0.4, 0.4, 0.0, redstoneDust)
+            world.spawnParticle(Particle.ELECTRIC_SPARK, nextLoc.clone().add(0.0, 0.8, 0.0), 4, 0.3, 0.3, 0.3, 0.02)
+        }
+    }
+
+    // ========================================================================
+    // DISORIENTING COMBAT MELEE BLINK (CONFUSES PLAYERS WHEN MELEE'D)
+    // ========================================================================
+
+    fun tryCombatMeleeBlink(attacker: Player) {
+        if (isDeadOrRemoved || isDyingAnimation || isFloatingInvulnerable || isSlamming || currentPhase <= 0) return
+        if (!ensureLiveMannequin()) return
+
+        val now = System.currentTimeMillis()
+        if (now - lastMeleeBlinkMillis < 1200L) return
+        lastMeleeBlinkMillis = now
+
+        val origin = mannequin.location.clone()
+        world.playSound(origin, Sound.ENTITY_ENDERMAN_TELEPORT, SoundCategory.HOSTILE, 2.0f, 1.2f)
+        world.spawnParticle(Particle.DUST, origin.clone().add(0.0, 1.0, 0.0), 25, 0.4, 0.6, 0.4, 0.0, redstoneDust)
+        world.spawnParticle(Particle.ELECTRIC_SPARK, origin.clone().add(0.0, 1.0, 0.0), 15, 0.4, 0.6, 0.4, 0.05)
+
+        val pLoc = attacker.location
+        var dest: Location? = null
+        repeat(10) {
+            val angle = Random.nextDouble(0.0, 2.0 * Math.PI)
+            val dist = Random.nextDouble(3.2, 5.5)
+            val candidate = Location(world, pLoc.x + cos(angle) * dist, pLoc.y, pLoc.z + sin(angle) * dist)
+            val groundY = findArenaGroundY(candidate, pLoc.y)
+            candidate.y = groundY
+            if (candidate.block.isPassable && candidate.clone().add(0.0, 1.0, 0.0).block.isPassable) {
+                dest = candidate
+                return@repeat
+            }
+        }
+
+        val finalDest = dest ?: return
+        val lookDir = attacker.eyeLocation.toVector().subtract(finalDest.clone().add(0.0, 1.62, 0.0).toVector())
+        if (lookDir.lengthSquared() > 1e-4) {
+            finalDest.setDirection(lookDir)
+        }
+
+        mannequin.teleport(finalDest)
+        faceLocation(attacker.eyeLocation)
+        world.playSound(finalDest, Sound.ENTITY_ENDERMAN_TELEPORT, SoundCategory.HOSTILE, 2.0f, 0.8f)
+        world.spawnParticle(Particle.DUST, finalDest.clone().add(0.0, 1.0, 0.0), 25, 0.4, 0.6, 0.4, 0.0, redstoneDust)
+        world.spawnParticle(Particle.ELECTRIC_SPARK, finalDest.clone().add(0.0, 1.0, 0.0), 15, 0.4, 0.6, 0.4, 0.05)
     }
 
     // ========================================================================
@@ -149,16 +304,7 @@ class ActiveHerobrineFight(
         currentPhase = 1
         currentTarget = firstAttacker ?: resolveSummonerOrNearest()
 
-        // Phase 1 BossBar starts WHITE
-        val barSettings = BossBarSettings(
-            enabled = true,
-            title = "<bold><white>Herobrine</white></bold>",
-            color = BossBar.Color.WHITE,
-            overlay = BossBar.Overlay.NOTCHED_10,
-            flags = setOf(BossBar.Flag.DARKEN_SCREEN),
-            radius = 96.0
-        )
-        plugin.bossBarManager.createBossBar(mannequin, barSettings)
+        syncPhaseBossBar()
 
         world.setStorm(true)
         world.isThundering = true
@@ -175,87 +321,78 @@ class ActiveHerobrineFight(
         }
 
         enterFloatingInvulnerableState(spawnSteves = false)
-        runLater(40L) {
-            if (!isDeadOrRemoved) {
-                val slamTarget = pickRandomOrSolePlayer() ?: return@runLater
-                performPhase1RedstoneSlam(slamTarget)
+        runLater(45L) {
+            if (!isDeadOrRemoved && ensureLiveMannequin()) {
+                val slamTarget = pickRandomOrSolePlayer() ?: currentTarget ?: resolveSummonerOrNearest()
+                if (slamTarget != null) {
+                    performPhase1RedstoneSlam(slamTarget)
+                } else {
+                    isFloatingInvulnerable = false
+                    isSlamming = false
+                    mannequin.setGravity(true)
+                    mannequin.equipment.setItemInMainHand(ItemStack(Material.IRON_SWORD))
+                }
             }
         }
     }
 
     // ========================================================================
-    // PHASE TRANSITIONS (EVERY 500 HP MARK + DARKNESS UNTIL EXPLOSION)
+    // PHASE TRANSITIONS (EVERY 500 HP MARK + SMOOTH FLOAT + DARKNESS)
     // ========================================================================
 
     private fun playPhaseTransitionAnimation(isPhase3Rainbow: Boolean, onExplosionComplete: () -> Unit) {
         damageSinceLastSteveWave = 0.0
         waitingForStevesToDie = false
+        floatingSteveWaitTicks = 0
         activeSteves.forEach { if (it.mannequin.isValid) it.mannequin.remove() }
         activeSteves.clear()
 
-        isFloatingInvulnerable = true
-        mannequin.setGravity(false)
-        val floatLoc = mannequin.location.clone().add(0.0, 6.0, 0.0)
-        mannequin.teleport(floatLoc)
-        mannequin.velocity = Vector(0.0, 0.0, 0.0)
-        mannequin.equipment.setItemInMainHand(ItemStack(Material.AIR))
-
-        // Darkness to nearby players until explosion at tick 75
         mannequin.location.getNearbyPlayers(96.0).forEach { player ->
-            player.addPotionEffect(PotionEffect(PotionEffectType.DARKNESS, 85, 0, false, false, true))
+            player.addPotionEffect(PotionEffect(PotionEffectType.DARKNESS, 95, 0, false, false, true))
         }
 
-        // 16x16 Rainbow ground aura during Phase 3 transition
-        var rainbowTask: BukkitTask? = null
-        if (isPhase3Rainbow) {
-            rainbowTask = runTimer(1L, 2L) {
-                if (isDeadOrRemoved || !mannequin.isValid) return@runTimer
-                spawnRainbowGroundAura(mannequin.location, radius = 8.0, count = 24)
-            }
-        }
-
-        // 4 Successive Lightning Strikes at ticks 15, 30, 45, 60
-        listOf(15L, 30L, 45L, 60L).forEach { delay ->
-            runLater(delay) {
-                if (isDeadOrRemoved || !mannequin.isValid) return@runLater
-                val loc = mannequin.location
-                world.strikeLightningEffect(loc)
-                world.playSound(loc, Sound.ENTITY_LIGHTNING_BOLT_THUNDER, SoundCategory.HOSTILE, 3.0f, 0.8f)
-                world.spawnParticle(
-                    Particle.DUST_COLOR_TRANSITION,
-                    loc.clone().add(0.0, 1.0, 0.0),
-                    60, 1.2, 1.2, 1.2, 0.0,
-                    deepRedTransition
-                )
-            }
-        }
-
-        // Tick 75: Clear Darkness & Explode
-        runLater(75L) {
-            rainbowTask?.cancel()
-            if (isDeadOrRemoved || !mannequin.isValid) return@runLater
-            val loc = mannequin.location
-
-            loc.getNearbyPlayers(128.0).forEach { player ->
-                player.removePotionEffect(PotionEffectType.DARKNESS)
-            }
-
-            val explosionPower = if (isPhase3Rainbow) 6.0f else 4.0f // 6.0f = End Crystal damage, 4.0f = TNT damage
-            world.createExplosion(loc, explosionPower, false, false, mannequin)
-            world.spawnParticle(Particle.EXPLOSION_EMITTER, loc, 1)
-
-            if (isPhase3Rainbow) {
-                // Strike lightning on his 3x3 radius
-                for (dx in listOf(-3.0, 0.0, 3.0)) {
-                    for (dz in listOf(-3.0, 0.0, 3.0)) {
-                        val lLoc = loc.clone().add(dx, 0.0, dz)
-                        lLoc.y = (world.getHighestBlockYAt(lLoc) + 1).toDouble()
-                        world.strikeLightningEffect(lLoc)
-                    }
+        levitateToFloatHeight(heightAboveFloor = 5.5, durationTicks = 25) {
+            listOf(15L, 30L, 45L, 60L).forEach { delay ->
+                runLater(delay) {
+                    if (isDeadOrRemoved || !ensureLiveMannequin()) return@runLater
+                    val loc = mannequin.location
+                    world.strikeLightningEffect(loc)
+                    world.playSound(loc, Sound.ENTITY_LIGHTNING_BOLT_THUNDER, SoundCategory.HOSTILE, 3.0f, 0.8f)
+                    world.spawnParticle(
+                        Particle.DUST_COLOR_TRANSITION,
+                        loc.clone().add(0.0, 1.0, 0.0),
+                        60, 1.2, 1.2, 1.2, 0.0,
+                        deepRedTransition
+                    )
                 }
             }
 
-            onExplosionComplete()
+            runLater(70L) {
+                if (isDeadOrRemoved || !ensureLiveMannequin()) return@runLater
+                val loc = mannequin.location
+                val arenaFloorLoc = Location(world, loc.x, findArenaGroundY(loc, spawnOrigin.y), loc.z)
+
+                loc.getNearbyPlayers(128.0).forEach { player ->
+                    player.removePotionEffect(PotionEffectType.DARKNESS)
+                }
+
+                val explosionPower = if (isPhase3Rainbow) 6.0f else 4.0f
+                world.createExplosion(arenaFloorLoc, explosionPower, false, false, mannequin)
+                world.spawnParticle(Particle.EXPLOSION_EMITTER, loc, 1)
+                world.spawnParticle(Particle.EXPLOSION_EMITTER, arenaFloorLoc, 1)
+
+                if (isPhase3Rainbow) {
+                    for (dx in listOf(-1.0, 0.0, 1.0)) {
+                        for (dz in listOf(-1.0, 0.0, 1.0)) {
+                            val lLoc = arenaFloorLoc.clone().add(dx, 0.0, dz)
+                            lLoc.y = findArenaGroundY(lLoc, arenaFloorLoc.y)
+                            world.strikeLightningEffect(lLoc)
+                        }
+                    }
+                }
+
+                onExplosionComplete()
+            }
         }
     }
 
@@ -265,11 +402,7 @@ class ActiveHerobrineFight(
         mannequin.health = config.phase2Threshold // 1000.0 HP
 
         mannequin.customName("<bold><red>Herobrine</red></bold>".mm())
-        plugin.bossBarManager.updateBarAppearance(
-            mannequin,
-            titleMiniMessage = "<bold><red>Herobrine</red></bold>",
-            color = BossBar.Color.RED
-        )
+        syncPhaseBossBar()
 
         playPhaseTransitionAnimation(isPhase3Rainbow = false) {
             val target = pickRandomOrSolePlayer() ?: resolveCombatTarget()
@@ -277,6 +410,7 @@ class ActiveHerobrineFight(
                 performPhase2PreSlamSequence(target)
             } else {
                 isFloatingInvulnerable = false
+                isSlamming = false
                 mannequin.setGravity(true)
                 mannequin.equipment.setItemInMainHand(ItemStack(Material.DIAMOND_SWORD))
             }
@@ -290,11 +424,7 @@ class ActiveHerobrineFight(
 
         mannequin.isGlowing = true
         mannequin.customName("<bold><light_purple>Herobrine</light_purple></bold>".mm())
-        plugin.bossBarManager.updateBarAppearance(
-            mannequin,
-            titleMiniMessage = "<bold><light_purple>Herobrine</light_purple></bold>",
-            color = BossBar.Color.PURPLE
-        )
+        syncPhaseBossBar()
 
         playPhaseTransitionAnimation(isPhase3Rainbow = true) {
             val target = pickRandomOrSolePlayer() ?: resolveCombatTarget()
@@ -302,27 +432,58 @@ class ActiveHerobrineFight(
                 performPhase3PreSlamSequence(target)
             } else {
                 isFloatingInvulnerable = false
+                isSlamming = false
                 mannequin.setGravity(true)
                 mannequin.equipment.setItemInMainHand(ItemStack(Material.NETHERITE_SWORD))
             }
         }
     }
 
-    private fun spawnRainbowGroundAura(center: Location, radius: Double, count: Int) {
-        val groundY = world.getHighestBlockYAt(center).toDouble() + 0.2
-        repeat(count) {
-            val dx = Random.nextDouble(-radius, radius)
-            val dz = Random.nextDouble(-radius, radius)
-            val yOffset = Random.nextDouble(0.0, 6.0)
+    // ========================================================================
+    // 32x32 PHASE-CHANGING ARENA PARTICLE AURA (radius = 16.0 blocks)
+    // ========================================================================
+
+    private fun tickPhaseArenaAura(center: Location) {
+        if (currentPhase <= 0) return
+        val halfSize = 16.0 // 32x32 footprint!
+        val groundY = findArenaGroundY(center, spawnOrigin.y) + 0.2
+
+        repeat(24) {
+            val dx = Random.nextDouble(-halfSize, halfSize)
+            val dz = Random.nextDouble(-halfSize, halfSize)
+            val yOffset = Random.nextDouble(0.0, 5.5)
             val pt = Location(world, center.x + dx, groundY + yOffset, center.z + dz)
-            val c1 = rainbowDustColors.random()
-            val c2 = rainbowDustColors.random()
-            world.spawnParticle(
-                Particle.DUST_COLOR_TRANSITION,
-                pt,
-                1, 0.1, 0.4, 0.1, 0.0,
-                Particle.DustTransition(c1, c2, 1.7f)
-            )
+
+            when (currentPhase) {
+                1 -> {
+                    world.spawnParticle(Particle.DUST, pt, 1, 0.1, 0.2, 0.1, 0.0, redstoneDust)
+                    if (it % 3 == 0) {
+                        world.spawnParticle(Particle.END_ROD, pt, 1, 0.05, 0.1, 0.05, 0.01)
+                        world.spawnParticle(Particle.ELECTRIC_SPARK, pt, 1, 0.05, 0.1, 0.05, 0.02)
+                    }
+                }
+                2 -> {
+                    world.spawnParticle(Particle.DUST_COLOR_TRANSITION, pt, 1, 0.15, 0.3, 0.15, 0.0, deepRedTransition)
+                    if (it % 3 == 0) {
+                        world.spawnParticle(Particle.SOUL_FIRE_FLAME, pt, 1, 0.05, 0.1, 0.05, 0.01)
+                        world.spawnParticle(Particle.LARGE_SMOKE, pt, 1, 0.1, 0.1, 0.1, 0.01)
+                    }
+                }
+                else -> {
+                    val c1 = rainbowDustColors.random()
+                    val c2 = rainbowDustColors.random()
+                    world.spawnParticle(
+                        Particle.DUST_COLOR_TRANSITION,
+                        pt,
+                        1, 0.15, 0.35, 0.15, 0.0,
+                        Particle.DustTransition(c1, c2, 1.7f)
+                    )
+                    if (it % 3 == 0) {
+                        world.spawnParticle(Particle.END_ROD, pt, 1, 0.05, 0.1, 0.05, 0.02)
+                        world.spawnParticle(Particle.PORTAL, pt, 2, 0.1, 0.1, 0.1, 0.05)
+                    }
+                }
+            }
         }
     }
 
@@ -331,10 +492,13 @@ class ActiveHerobrineFight(
     // ========================================================================
 
     private fun scheduleCoreLoops() {
-        // 2-Tick Loop: Redstone, Spark, Enchanting Table, and Phase 3 Prismatic Rainbow Glow
+        // 2-Tick Loop: Body Aura + 32x32 Arena Aura
         runTimer(2L, 2L) {
-            if (!mannequin.isValid || mannequin.isDead || isDeadOrRemoved || isDyingAnimation) return@runTimer
+            if (isDeadOrRemoved || isDyingAnimation) return@runTimer
+            if (!ensureLiveMannequin() || mannequin.isDead) return@runTimer
             val pLoc = mannequin.location.add(0.0, 1.1, 0.0)
+
+            tickPhaseArenaAura(mannequin.location)
 
             if (currentPhase >= 3) {
                 rainbowColorIndex = (rainbowColorIndex + 1) % rainbowTeamColors.size
@@ -362,7 +526,8 @@ class ActiveHerobrineFight(
 
         // 1-Tick AI Loop
         runTimer(1L, 1L) {
-            if (!mannequin.isValid || mannequin.isDead || isDeadOrRemoved || isDyingAnimation) return@runTimer
+            if (isDeadOrRemoved || isDyingAnimation) return@runTimer
+            if (!ensureLiveMannequin() || mannequin.isDead) return@runTimer
             if (attackCooldownTicks > 0) attackCooldownTicks--
 
             if (mannequin.location.distanceSquared(spawnOrigin) > config.maxCombatDistance * config.maxCombatDistance) {
@@ -376,36 +541,57 @@ class ActiveHerobrineFight(
                 return@runTimer
             }
 
-            val target = resolveCombatTarget() ?: return@runTimer
-            if (activeSteves.isNotEmpty()) {
-                val iter = activeSteves.iterator()
-                while (iter.hasNext()) {
-                    val steve = iter.next()
-                    if (!steve.mannequin.isValid || steve.mannequin.isDead) {
-                        iter.remove()
-                    } else {
-                        steve.tick(target)
-                    }
+            activeSteves.removeIf { it.mannequin.isDead }
+
+            val target = resolveCombatTarget()
+            if (target != null && activeSteves.isNotEmpty()) {
+                for (steve in activeSteves) {
+                    steve.tick(target)
                 }
-                if (waitingForStevesToDie && activeSteves.isEmpty()) {
+            }
+
+            if (waitingForStevesToDie && !isLevitatingUp) {
+                floatingSteveWaitTicks++
+
+                // In Phase 3, while floating with minions, periodically unleash his Wither Skull Attack!
+                if (currentPhase >= 3 && floatingSteveWaitTicks % 160 == 60 && activeSteves.isNotEmpty()) {
+                    triggerWitherSkullVolley()
+                }
+
+                if (activeSteves.isEmpty() || floatingSteveWaitTicks >= 1200) {
                     waitingForStevesToDie = false
+                    floatingSteveWaitTicks = 0
+                    activeSteves.forEach { if (it.mannequin.isValid) it.mannequin.remove() }
+                    activeSteves.clear()
+
                     val chosen = pickRandomOrSolePlayer() ?: target
-                    when (currentPhase) {
-                        1 -> performPhase1RedstoneSlam(chosen)
-                        2 -> performPhase2PreSlamSequence(chosen)
-                        else -> performPhase3PreSlamSequence(chosen)
+                    if (chosen != null) {
+                        when (currentPhase) {
+                            1 -> performPhase1RedstoneSlam(chosen)
+                            2 -> performPhase2PreSlamSequence(chosen)
+                            else -> performPhase3PreSlamSequence(chosen)
+                        }
+                    } else {
+                        isFloatingInvulnerable = false
+                        isSlamming = false
+                        mannequin.setGravity(true)
+                        mannequin.equipment.setItemInMainHand(ItemStack(getPhaseSwordMaterial()))
                     }
                     return@runTimer
                 }
             }
 
             if (isFloatingInvulnerable) {
-                mannequin.velocity = Vector(0.0, sin(Bukkit.getCurrentTick() * 0.15) * 0.04, 0.0)
-                faceLocation(target.eyeLocation)
+                if (!isLevitatingUp) {
+                    mannequin.velocity = Vector(0.0, sin(Bukkit.getCurrentTick() * 0.15) * 0.04, 0.0)
+                }
+                if (target != null) {
+                    faceLocation(target.eyeLocation)
+                }
                 return@runTimer
             }
 
-            if (isSlamming) return@runTimer
+            if (isSlamming || target == null) return@runTimer
 
             tickGroundCombat(target)
         }
@@ -479,6 +665,15 @@ class ActiveHerobrineFight(
                 fireHomingArrow(target)
             }
         }
+    }
+
+    private fun isFrontalHit(victim: LivingEntity, attacker: Entity): Boolean {
+        val yawRad = Math.toRadians(victim.yaw.toDouble())
+        val lookX = -sin(yawRad)
+        val lookZ = cos(yawRad)
+        val toAttackerX = attacker.location.x - victim.location.x
+        val toAttackerZ = attacker.location.z - victim.location.z
+        return (lookX * toAttackerX + lookZ * toAttackerZ) >= 0.0
     }
 
     private fun executePvpMeleeStrike(target: Player) {
@@ -574,50 +769,55 @@ class ActiveHerobrineFight(
     }
 
     // ========================================================================
-    // STEVE WAVES (PHASE 1 = 2+2, PHASE 2 = 3+3, PHASE 3 = 5+5 NETHERITE)
+    // STEVE WAVES (PHASE 1 = 4-4, PHASE 2 = 7-7, PHASE 3 = 10-10 + BELL SOUND)
     // ========================================================================
 
     private fun enterFloatingInvulnerableState(spawnSteves: Boolean) {
-        isFloatingInvulnerable = true
-        mannequin.setGravity(false)
-        val floatLoc = mannequin.location.clone().add(0.0, 5.5, 0.0)
-        mannequin.teleport(floatLoc)
-        mannequin.velocity = Vector(0.0, 0.0, 0.0)
-        mannequin.equipment.setItemInMainHand(ItemStack(Material.AIR))
-
-        world.playSound(floatLoc, Sound.ENTITY_ENDERMAN_TELEPORT, SoundCategory.HOSTILE, 2.0f, 0.6f)
-        world.spawnParticle(Particle.DUST, floatLoc.add(0.0, 1.0, 0.0), 40, 0.6, 0.8, 0.6, 0.0, redstoneDust)
+        val baseLoc = mannequin.location.clone()
+        val arenaFloorY = findArenaGroundY(baseLoc, spawnOrigin.y)
 
         if (spawnSteves) {
             waitingForStevesToDie = true
-            spawnSteveWave(phaseTier = currentPhase)
+            floatingSteveWaitTicks = 0
+        }
+
+        levitateToFloatHeight(heightAboveFloor = 5.0, durationTicks = 25) {
+            if (spawnSteves) {
+                spawnSteveWave(phaseTier = currentPhase, referenceLoc = Location(world, baseLoc.x, arenaFloorY, baseLoc.z))
+            }
         }
     }
 
-    private fun spawnSteveWave(phaseTier: Int) {
-        val center = spawnOrigin.clone()
+    private fun spawnSteveWave(phaseTier: Int, referenceLoc: Location) {
         val countPerType = when (phaseTier) {
-            3 -> 5
-            2 -> 3
-            else -> 2
+            3 -> 10 // 10 Melee + 10 Archer = 20 Steves
+            2 -> 7  // 7 Melee + 7 Archer = 14 Steves
+            else -> 4 // 4 Melee + 4 Archer = 8 Steves
         }
         val total = countPerType * 2
 
-        world.playSound(center, Sound.BLOCK_END_PORTAL_FRAME_FILL, SoundCategory.HOSTILE, 2.5f, 0.5f)
+        world.playSound(referenceLoc, Sound.BLOCK_BELL_RESONATE, SoundCategory.HOSTILE, 3.5f, 0.65f)
+        world.playSound(referenceLoc, Sound.BLOCK_BELL_USE, SoundCategory.HOSTILE, 3.0f, 0.6f)
+        world.playSound(referenceLoc, Sound.BLOCK_END_PORTAL_FRAME_FILL, SoundCategory.HOSTILE, 2.5f, 0.5f)
+
         for (i in 0 until total) {
             val angle = 2.0 * Math.PI * i / total
-            val sLoc = center.clone().add(cos(angle) * 4.5, 0.0, sin(angle) * 4.5)
-            sLoc.y = (world.getHighestBlockYAt(sLoc) + 1).toDouble()
-            world.strikeLightningEffect(sLoc)
+            val ringRadius = 4.0 + (i % 3) * 2.2
+            val candidate = referenceLoc.clone().add(cos(angle) * ringRadius, 0.0, sin(angle) * ringRadius)
+            candidate.y = findArenaGroundY(candidate, referenceLoc.y)
+            if (i % 2 == 0) {
+                world.strikeLightningEffect(candidate)
+            }
 
             val isArcher = i >= countPerType
-            val controller = SteveMinionController.spawnSteve(sLoc, isArcher = isArcher, phaseTier = phaseTier)
+            val controller = SteveMinionController.spawnSteve(candidate, isArcher = isArcher, phaseTier = phaseTier)
+            steveTeam?.addEntity(controller.mannequin)
             activeSteves.add(controller)
         }
     }
 
     // ========================================================================
-    // PHASE 2 PRE-SLAM SEQUENCE
+    // PHASE 2 PRE-SLAM: LIGHTNING -> LASER -> 1 TRIDENT/PLAYER -> WITHER (1x) -> 3s DELAY -> SLAM
     // ========================================================================
 
     private fun performPhase2PreSlamSequence(target: Player) {
@@ -625,17 +825,36 @@ class ActiveHerobrineFight(
         isSlamming = true
         currentTarget = target
 
+        // 1. Ticks 0..170: Condensed 5-Wave Lightning Circles + Star
         scheduleWaveThenStarCycle(startDelay = 0L, applyWither = false)
 
-        runLater(170L) {
-            if (isDeadOrRemoved || !mannequin.isValid) return@runLater
-            val tridentTarget = pickRandomOrSolePlayer() ?: resolveCombatTarget() ?: target
-            chargeAndThrowChannelingTrident(tridentTarget)
+        // 2. Ticks 175..215: Guardian Laser Lock-On
+        runLater(175L) {
+            if (isDeadOrRemoved || !ensureLiveMannequin()) return@runLater
+            spawnGuardianLaserLockOn(durationTicks = 40, fallbackTarget = target)
+        }
+
+        // 3. Tick 218: Throw 1 Channeling Trident at each nearby player
+        runLater(218L) {
+            if (isDeadOrRemoved || !ensureLiveMannequin()) return@runLater
+            throwTridentVolleyAtAllPlayers(fallbackTarget = target)
+        }
+
+        // 4. Tick 250: Enraged Wither 360° Homing Skull Attack (1x, lightning on player hit)
+        runLater(250L) {
+            if (isDeadOrRemoved || !ensureLiveMannequin()) return@runLater
+            triggerWitherSkullVolley()
+        }
+
+        // 5. Tick 345: 3-Second Telegraph Delay -> 3x3 Phase 2 Lightning Slam
+        runLater(345L) {
+            if (isDeadOrRemoved || !ensureLiveMannequin()) return@runLater
+            scheduleThreeSecondDelayedSlam(fallbackTarget = target, isPhase3 = false)
         }
     }
 
     // ========================================================================
-    // PHASE 3 PRE-SLAM SEQUENCE
+    // PHASE 3 PRE-SLAM: LIGHTNING -> LASER -> 3 SETS OF TRIDENTS -> WITHER (2x) -> DRAGON LASER -> 3s DELAY -> SLAM
     // ========================================================================
 
     private fun performPhase3PreSlamSequence(target: Player) {
@@ -643,18 +862,399 @@ class ActiveHerobrineFight(
         isSlamming = true
         currentTarget = target
 
-        // Cycle 1: Wave -> Star (ticks 0..165)
+        // 1. Ticks 0..170: Condensed 5-Wave Lightning Circles + Star
         scheduleWaveThenStarCycle(startDelay = 0L, applyWither = true)
 
-        // Cycle 2: Wave -> Star (ticks 175..340)
-        scheduleWaveThenStarCycle(startDelay = 175L, applyWither = true)
+        // 2. Ticks 175..215: Guardian Laser Lock-On
+        runLater(175L) {
+            if (isDeadOrRemoved || !ensureLiveMannequin()) return@runLater
+            spawnGuardianLaserLockOn(durationTicks = 40, fallbackTarget = target)
+        }
 
-        // Step 3 (Tick 350): Guardian Laser -> Riptiding Steves -> 10-Damage Final Slam
-        runLater(350L) {
-            if (isDeadOrRemoved || !mannequin.isValid) return@runLater
-            performPhase3GuardianLaserAndRiptideSlam(target)
+        // 3. Ticks 218, 244, 270: Three Sets (3 Volleys) of Channeling Trident Attacks on all nearby players
+        listOf(218L, 244L, 270L).forEach { delay ->
+            runLater(delay) {
+                if (isDeadOrRemoved || !ensureLiveMannequin()) return@runLater
+                throwTridentVolleyAtAllPlayers(fallbackTarget = target)
+            }
+        }
+
+        // 4. Ticks 300 & 395: Enraged Wither 360° Homing Skull Attack TWICE (2x, lightning on player hit)
+        runLater(300L) {
+            if (isDeadOrRemoved || !ensureLiveMannequin()) return@runLater
+            triggerWitherSkullVolley()
+        }
+        runLater(395L) {
+            if (isDeadOrRemoved || !ensureLiveMannequin()) return@runLater
+            triggerWitherSkullVolley()
+        }
+
+        // 5. Tick 490..605: Outward-Spiraling Ender Dragon Laser Beam (Sonic Boom Charge/Fire + 2 hearts/tick)
+        runLater(490L) {
+            if (isDeadOrRemoved || !ensureLiveMannequin()) return@runLater
+            triggerPhase3DragonLaserSweep()
+        }
+
+        // 6. Tick 610: 3-Second Telegraph Delay -> 3x3 Phase 3 Final Slam
+        runLater(610L) {
+            if (isDeadOrRemoved || !ensureLiveMannequin()) return@runLater
+            scheduleThreeSecondDelayedSlam(fallbackTarget = target, isPhase3 = true)
         }
     }
+
+    // ========================================================================
+    // GUARDIAN LASER LOCK-ON & MULTI-PLAYER CHANNELING TRIDENT VOLLEYS
+    // ========================================================================
+
+    private fun spawnGuardianLaserLockOn(durationTicks: Int, fallbackTarget: Player) {
+        val eye = mannequin.location.add(0.0, 1.62, 0.0)
+        val laserGuardians = mutableListOf<Guardian>()
+
+        val targets = mannequin.location.getNearbyPlayers(config.followRange)
+            .filter { !it.isDead && (it.gameMode == GameMode.SURVIVAL || it.gameMode == GameMode.ADVENTURE) }
+            .ifEmpty { listOfNotNull(fallbackTarget.takeIf { !it.isDead }) }
+
+        for (p in targets) {
+            val g = world.spawn(eye, Guardian::class.java, CreatureSpawnEvent.SpawnReason.CUSTOM) { guardian ->
+                guardian.persistentDataContainer.set(MobKeys.HEROBRINE_MINION, PersistentDataType.BYTE, 1)
+                guardian.isInvisible = true
+                guardian.setInvulnerable(true)
+                guardian.isSilent = false
+                guardian.setAI(true)
+                guardian.setGravity(false)
+                guardian.target = p
+                guardian.setLaser(true)
+            }
+            laserGuardians.add(g)
+        }
+
+        var laserTick = 0
+        var laserTask: BukkitTask? = null
+        laserTask = runTimer(1L, 2L) {
+            laserTick += 2
+            if (isDeadOrRemoved || !ensureLiveMannequin() || laserTick >= durationTicks) {
+                laserTask?.cancel()
+                laserGuardians.forEach { it.remove() }
+                return@runTimer
+            }
+
+            val currentOrigin = mannequin.location.add(0.0, 1.62, 0.0)
+            laserGuardians.forEach { if (it.isValid) it.teleport(currentOrigin) }
+
+            val pitch = 0.6f + (laserTick / durationTicks.toFloat()) * 1.4f
+            world.playSound(currentOrigin, Sound.ENTITY_GUARDIAN_ATTACK, SoundCategory.HOSTILE, 2.0f, pitch)
+        }
+
+        runLater(durationTicks.toLong()) {
+            laserGuardians.forEach { it.remove() }
+        }
+    }
+
+    /**
+     * Throws 1 Channeling Trident at each nearby survival/adventure player in the arena.
+     */
+    private fun throwTridentVolleyAtAllPlayers(fallbackTarget: Player) {
+        val tridentStack = ItemStack(Material.TRIDENT).apply {
+            editMeta { it.addEnchant(Enchantment.CHANNELING, 1, true) }
+        }
+        mannequin.equipment.setItemInMainHand(tridentStack)
+        mannequin.swingMainHand()
+
+        val eye = mannequin.location.add(0.0, 1.62, 0.0)
+        world.playSound(eye, Sound.ITEM_TRIDENT_THUNDER, SoundCategory.HOSTILE, 3.0f, 1.2f)
+        world.playSound(eye, Sound.ITEM_TRIDENT_THROW, SoundCategory.HOSTILE, 2.5f, 0.9f)
+
+        val targets = mannequin.location.getNearbyPlayers(config.followRange)
+            .filter { !it.isDead && (it.gameMode == GameMode.SURVIVAL || it.gameMode == GameMode.ADVENTURE) }
+            .ifEmpty { listOfNotNull(fallbackTarget.takeIf { !it.isDead }) }
+
+        for (target in targets) {
+            faceLocation(target.eyeLocation)
+            val throwDir = target.eyeLocation.toVector().subtract(eye.toVector()).normalize()
+
+            val trident = world.spawn(eye.clone().add(throwDir), Trident::class.java, CreatureSpawnEvent.SpawnReason.CUSTOM) { t ->
+                t.shooter = mannequin
+                t.itemStack = tridentStack
+                t.velocity = throwDir.multiply(2.2)
+                t.damage = 0.0
+                t.pickupStatus = AbstractArrow.PickupStatus.DISALLOWED
+                t.persistentDataContainer.set(MobKeys.HEROBRINE_TRIDENT, PersistentDataType.BYTE, 1)
+            }
+
+            var flightTicks = 0
+            var watchTask: BukkitTask? = null
+            watchTask = runTimer(1L, 1L) {
+                flightTicks++
+                if (isDeadOrRemoved || !trident.isValid || trident.isDead || trident.isInBlock || flightTicks > 50) {
+                    if (trident.isValid && (trident.isInBlock || flightTicks > 50)) {
+                        world.strikeLightningEffect(trident.location)
+                        trident.remove()
+                    }
+                    watchTask?.cancel()
+                    return@runTimer
+                }
+                world.spawnParticle(Particle.DUST_COLOR_TRANSITION, trident.location, 3, 0.1, 0.1, 0.1, 0.0, deepRedTransition)
+            }
+        }
+
+        runLater(10L) {
+            if (!isDeadOrRemoved && mannequin.isValid && isFloatingInvulnerable) {
+                mannequin.equipment.setItemInMainHand(ItemStack(Material.AIR))
+            }
+        }
+    }
+
+    // ========================================================================
+    // ENRAGED WITHER 360° HOMING SKULL RING (STRIKES LIGHTNING ON PLAYER HIT)
+    // ========================================================================
+
+    private fun triggerWitherSkullVolley() {
+        if (isDeadOrRemoved || !ensureLiveMannequin()) return
+        val center = mannequin.location.clone().add(0.0, 1.2, 0.0)
+        val skulls = mutableListOf<WitherSkull>()
+
+        world.playSound(center, Sound.ENTITY_WITHER_SPAWN, SoundCategory.HOSTILE, 2.5f, 1.2f)
+        world.playSound(center, Sound.ENTITY_WARDEN_SONIC_BOOM, SoundCategory.HOSTILE, 2.0f, 1.8f)
+
+        for (i in 0 until 24) {
+            val angle = Math.toRadians(i * 15.0)
+            val motion = Vector(sin(angle) * 0.75, 0.35, cos(angle) * 0.75)
+            val skull = world.spawn(center, WitherSkull::class.java, CreatureSpawnEvent.SpawnReason.CUSTOM) { s ->
+                s.shooter = mannequin
+                s.velocity = motion
+                s.persistentDataContainer.set(MobKeys.HEROBRINE_MINION, PersistentDataType.BYTE, 1)
+                herobrineTeam?.addEntity(s)
+            }
+            skulls.add(skull)
+        }
+
+        runLater(20L) {
+            if (isDeadOrRemoved) {
+                skulls.forEach { if (it.isValid) it.remove() }
+                return@runLater
+            }
+
+            val target = pickRandomOrSolePlayer() ?: resolveCombatTarget()
+            skulls.filter { it.isValid }.forEach { s ->
+                s.velocity = Vector(0.0, 0.0, 0.0)
+                s.setGravity(false)
+                s.isGlowing = true
+                if (target != null) {
+                    val dir = target.eyeLocation.toVector().subtract(s.location.toVector())
+                    if (dir.lengthSquared() > 1e-4) {
+                        val rot = s.location.setDirection(dir)
+                        s.setRotation(rot.yaw, rot.pitch)
+                    }
+                }
+            }
+
+            listOf(8L to 0.5f, 16L to 0.8f, 24L to 1.3f).forEach { (delay, pitch) ->
+                runLater(delay) {
+                    val p = pickRandomOrSolePlayer() ?: resolveCombatTarget() ?: return@runLater
+                    p.playSound(p.location, Sound.ENTITY_EXPERIENCE_ORB_PICKUP, SoundCategory.HOSTILE, 1.0f, pitch)
+                    skulls.filter { it.isValid }.forEach { s ->
+                        val dir = p.eyeLocation.toVector().subtract(s.location.toVector())
+                        if (dir.lengthSquared() > 1e-4) {
+                            val rot = s.location.setDirection(dir)
+                            s.setRotation(rot.yaw, rot.pitch)
+                        }
+                    }
+                }
+            }
+
+            runLater(32L) {
+                val p = pickRandomOrSolePlayer() ?: resolveCombatTarget()
+                if (p != null) {
+                    world.playSound(mannequin.location, Sound.ENTITY_WITHER_SHOOT, SoundCategory.HOSTILE, 3.0f, 0.8f)
+                }
+
+                var homeStep = 0
+                var homeTask: BukkitTask? = null
+                homeTask = runTimer(1L, 1L) {
+                    homeStep++
+                    val liveTarget = resolveCombatTarget()
+                    val validSkulls = skulls.filter { it.isValid && !it.isDead }
+
+                    if (isDeadOrRemoved || validSkulls.isEmpty() || homeStep > 40) {
+                        validSkulls.forEach { s ->
+                            world.spawnParticle(Particle.EXPLOSION, s.location, 2, 0.2, 0.2, 0.2, 0.0)
+                            s.remove()
+                        }
+                        homeTask?.cancel()
+                        return@runTimer
+                    }
+
+                    for (s in validSkulls) {
+                        if (liveTarget != null) {
+                            val desired = liveTarget.eyeLocation.toVector().subtract(s.location.toVector())
+                            if (desired.lengthSquared() > 1e-4) {
+                                desired.normalize()
+                                val cur = s.velocity
+                                val steered = if (cur.lengthSquared() > 1e-4) {
+                                    cur.normalize().multiply(0.70).add(desired.multiply(0.30)).normalize()
+                                } else {
+                                    desired
+                                }
+                                s.velocity = steered.multiply(1.15)
+                            }
+                        }
+                        world.spawnParticle(Particle.DUST, s.location, 1, 0.05, 0.05, 0.05, 0.0, redstoneDust)
+
+                        val hitPlayer = s.location.getNearbyPlayers(1.6)
+                            .firstOrNull { !it.isDead && (it.gameMode == GameMode.SURVIVAL || it.gameMode == GameMode.ADVENTURE) }
+                        if (hitPlayer != null) {
+                            if (hitPlayer.isBlocking && isFrontalHit(hitPlayer, s)) {
+                                hitPlayer.world.playSound(hitPlayer.location, Sound.ITEM_SHIELD_BLOCK, SoundCategory.PLAYERS, 1.5f, 1.0f)
+                                hitPlayer.world.spawnParticle(Particle.CRIT, s.location, 12, 0.25, 0.25, 0.25, 0.1)
+                                val push = hitPlayer.location.toVector().subtract(s.location.toVector()).setY(0.0)
+                                if (push.lengthSquared() > 1e-4) push.normalize()
+                                hitPlayer.velocity = hitPlayer.velocity.add(push.multiply(0.35).setY(0.15))
+                                s.remove()
+                            } else {
+                                world.strikeLightningEffect(hitPlayer.location)
+                                world.playSound(hitPlayer.location, Sound.ENTITY_LIGHTNING_BOLT_THUNDER, SoundCategory.HOSTILE, 2.0f, 1.1f)
+                                val skullSource = DamageSource.builder(DamageType.WITHER_SKULL)
+                                    .withCausingEntity(mannequin)
+                                    .withDirectEntity(s)
+                                    .build()
+                                hitPlayer.damage(6.0, skullSource)
+                                s.remove()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // PHASE 3 FLOATING SKILL: OUTWARD-SPIRALING ENDER DRAGON LASER BEAM
+    // (Warden Sonic Boom Charge/Fire + Punchy Ground Debris + 2 Hearts/Tick)
+    // ========================================================================
+
+    private fun triggerPhase3DragonLaserSweep() {
+        val origin = mannequin.location.clone()
+        val chargeTicks = 30
+        val spiralTicks = 80
+        val totalTicks = chargeTicks + spiralTicks
+        val groundDebrisData = Material.REDSTONE_BLOCK.createBlockData()
+
+        world.playSound(origin, Sound.ENTITY_WARDEN_SONIC_CHARGE, SoundCategory.HOSTILE, 5.0f, 0.95f)
+        world.playSound(origin, Sound.BLOCK_BELL_RESONATE, SoundCategory.HOSTILE, 4.0f, 1.2f)
+
+        var tick = 0
+        var laserTask: BukkitTask? = null
+        laserTask = runTimer(1L, 1L) {
+            tick++
+            if (isDeadOrRemoved || !ensureLiveMannequin() || tick > totalTicks) {
+                laserTask?.cancel()
+                return@runTimer
+            }
+
+            val eye = mannequin.location.clone().add(0.0, 1.62, 0.0)
+
+            if (tick <= chargeTicks) {
+                world.spawnParticle(Particle.END_ROD, eye, 8, 1.2, 1.2, 1.2, 0.05)
+                if (tick % 6 == 0) {
+                    world.spawnParticle(Particle.FLASH, eye, 1, 0.1, 0.1, 0.1, 0.0, Color.WHITE)
+                }
+                return@runTimer
+            }
+
+            val laserStep = tick - chargeTicks
+            if (laserStep == 1) {
+                world.playSound(eye, Sound.ENTITY_WARDEN_SONIC_BOOM, SoundCategory.HOSTILE, 5.0f, 0.85f)
+                world.playSound(eye, Sound.ENTITY_GENERIC_EXPLODE, SoundCategory.HOSTILE, 4.0f, 0.9f)
+                world.spawnParticle(Particle.FLASH, eye, 2, 0.2, 0.2, 0.2, 0.0, Color.WHITE)
+            }
+
+            val spiralProgress = laserStep.toDouble() / spiralTicks
+            val currentRadius = 2.0 + spiralProgress * 22.0
+            val angleDeg = (laserStep * 16.0) % 360.0
+            val angleRad = Math.toRadians(angleDeg)
+
+            val targetX = mannequin.location.x + cos(angleRad) * currentRadius
+            val targetZ = mannequin.location.z + sin(angleRad) * currentRadius
+            val groundCandidate = Location(world, targetX, spawnOrigin.y, targetZ)
+            val targetY = findArenaGroundY(groundCandidate, spawnOrigin.y)
+            val groundImpactLoc = Location(world, targetX, targetY, targetZ)
+
+            val beamVec = groundImpactLoc.toVector().subtract(eye.toVector())
+            if (beamVec.lengthSquared() > 1e-4) {
+                val rotLoc = mannequin.location.clone().setDirection(beamVec)
+                mannequin.setRotation(rotLoc.yaw, rotLoc.pitch.coerceIn(-65f, 65f))
+                HerobrinePacketController.broadcastHeadRotation(mannequin.entityId, world.players, rotLoc.yaw, rotLoc.pitch)
+            }
+
+            val totalDist = beamVec.length()
+            val dir = beamVec.clone().normalize()
+            val c1 = rainbowDustColors[laserStep % rainbowDustColors.size]
+            val c2 = rainbowDustColors[(laserStep + 1) % rainbowDustColors.size]
+            val rainbowLaserDust = Particle.DustTransition(c1, c2, 1.8f)
+
+            val hitPlayersThisTick = HashSet<UUID>()
+            var d = 0.0
+            while (d <= totalDist) {
+                val pt = eye.clone().add(dir.clone().multiply(d))
+                world.spawnParticle(Particle.END_ROD, pt, 2, 0.06, 0.06, 0.06, 0.01)
+                world.spawnParticle(Particle.DRAGON_BREATH, pt, 2, 0.1, 0.1, 0.1, 0.01, 1.0f)
+                world.spawnParticle(Particle.DUST_COLOR_TRANSITION, pt, 1, 0.08, 0.08, 0.08, 0.0, rainbowLaserDust)
+
+                pt.getNearbyPlayers(2.0).forEach { p ->
+                    if (!p.isDead && (p.gameMode == GameMode.SURVIVAL || p.gameMode == GameMode.ADVENTURE)) {
+                        if (hitPlayersThisTick.add(p.uniqueId)) {
+                            inflictUnavoidableHerobrineLaserDamage(p, 4.0)
+                        }
+                    }
+                }
+                d += 1.3
+            }
+
+            world.spawnParticle(Particle.FLASH, groundImpactLoc.clone().add(0.0, 0.3, 0.0), 1, 0.15, 0.15, 0.15, 0.0, c1)
+            world.spawnParticle(Particle.EXPLOSION, groundImpactLoc.clone().add(0.0, 0.3, 0.0), 2, 0.4, 0.2, 0.4, 0.0)
+            world.spawnParticle(Particle.BLOCK, groundImpactLoc.clone().add(0.0, 0.3, 0.0), 20, 0.6, 0.3, 0.6, 0.15, groundDebrisData)
+            world.spawnParticle(Particle.DRAGON_BREATH, groundImpactLoc, 15, 1.0, 0.3, 1.0, 0.04, 1.0f)
+            world.spawnParticle(Particle.GUST, groundImpactLoc.clone().add(0.0, 0.3, 0.0), 2, 0.5, 0.2, 0.5, 0.0)
+
+            if (laserStep % 3 == 0) {
+                world.playSound(groundImpactLoc, Sound.ENTITY_DRAGON_FIREBALL_EXPLODE, SoundCategory.HOSTILE, 2.8f, 1.2f)
+                world.playSound(groundImpactLoc, Sound.ENTITY_GENERIC_EXPLODE, SoundCategory.HOSTILE, 2.2f, 0.9f)
+                world.playSound(groundImpactLoc, Sound.ITEM_MACE_SMASH_GROUND, SoundCategory.HOSTILE, 2.2f, 0.85f)
+            }
+
+            groundImpactLoc.getNearbyPlayers(2.4).forEach { p ->
+                if (!p.isDead && (p.gameMode == GameMode.SURVIVAL || p.gameMode == GameMode.ADVENTURE)) {
+                    if (hitPlayersThisTick.add(p.uniqueId)) {
+                        inflictUnavoidableHerobrineLaserDamage(p, 4.0)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun inflictUnavoidableHerobrineLaserDamage(player: Player, damage: Double) {
+        player.noDamageTicks = 0
+        val unblockableSource = DamageSource.builder(DamageType.SONIC_BOOM)
+            .withCausingEntity(mannequin)
+            .withDirectEntity(mannequin)
+            .build()
+        val hpBefore = player.health
+        player.damage(damage, unblockableSource)
+        if (player.isValid && !player.isDead && (hpBefore - player.health) < damage * 0.9) {
+            val newHp = (hpBefore - damage).coerceAtLeast(0.0)
+            if (newHp <= 0.0) {
+                player.health = 0.0
+            } else {
+                player.health = newHp
+                player.playHurtAnimation(0f)
+                player.world.playSound(player.location, Sound.ENTITY_PLAYER_HURT, SoundCategory.PLAYERS, 1.0f, 1.0f)
+            }
+        }
+    }
+
+    // ========================================================================
+    // CONDENSED 5-WAVE LIGHTNING CIRCLES + CENTER STRIKE + 5-POINTED STAR
+    // ========================================================================
 
     private fun scheduleWaveThenStarCycle(startDelay: Long, applyWither: Boolean) {
         val armorIgnoreSource = DamageSource.builder(DamageType.SONIC_BOOM)
@@ -662,35 +1262,52 @@ class ActiveHerobrineFight(
             .withDirectEntity(mannequin)
             .build()
 
-        val waveRadii = listOf(4.5, 8.5, 12.5)
+        val waveRadii = listOf(1.5, 3.2, 5.0, 7.0, 9.5)
         waveRadii.forEachIndexed { waveIdx, radius ->
-            val telegraphDelay = startDelay + waveIdx * 24L
+            val telegraphDelay = startDelay + waveIdx * 18L
 
             runLater(telegraphDelay) {
                 if (isDeadOrRemoved) return@runLater
-                val arenaLoc = (resolveCombatTarget() ?: return@runLater).location.clone()
-                arenaLoc.y = (world.getHighestBlockYAt(arenaLoc) + 1).toDouble()
+                val targetLoc = resolveCombatTarget()?.location ?: spawnOrigin
+                val arenaLoc = targetLoc.clone().apply {
+                    y = findArenaGroundY(this, targetLoc.y)
+                }
 
-                world.playSound(arenaLoc, Sound.BLOCK_RESPAWN_ANCHOR_CHARGE, SoundCategory.HOSTILE, 2.5f, 0.8f + waveIdx * 0.2f)
-                val points = (radius * 6).toInt()
+                world.playSound(arenaLoc, Sound.BLOCK_RESPAWN_ANCHOR_CHARGE, SoundCategory.HOSTILE, 2.5f, 0.7f + waveIdx * 0.15f)
+                val points = (radius * 8).toInt().coerceAtLeast(16)
                 for (i in 0 until points) {
                     val angle = 2.0 * Math.PI * i / points
                     val pt = arenaLoc.clone().add(cos(angle) * radius, 0.2, sin(angle) * radius)
                     world.spawnParticle(Particle.DUST_COLOR_TRANSITION, pt, 3, 0.1, 0.1, 0.1, 0.0, deepRedTransition)
                 }
+                if (waveIdx == 0) {
+                    world.spawnParticle(Particle.DUST_COLOR_TRANSITION, arenaLoc.clone().add(0.0, 0.2, 0.0), 12, 0.4, 0.1, 0.4, 0.0, deepRedTransition)
+                }
 
-                // Strikes lightning exactly 12 ticks after the telegraph warning
-                runLater(12L) {
+                runLater(10L) {
                     if (isDeadOrRemoved) return@runLater
-                    val strikes = 8 + waveIdx * 2
+
+                    if (waveIdx == 0) {
+                        world.strikeLightningEffect(arenaLoc)
+                        arenaLoc.getNearbyPlayers(2.0).forEach { p ->
+                            if (!p.isDead && (p.gameMode == GameMode.SURVIVAL || p.gameMode == GameMode.ADVENTURE)) {
+                                p.damage(5.0, armorIgnoreSource)
+                                if (applyWither) {
+                                    p.addPotionEffect(PotionEffect(PotionEffectType.WITHER, 200, 0, false, true, true))
+                                }
+                            }
+                        }
+                    }
+
+                    val strikes = 6 + waveIdx * 4
                     for (i in 0 until strikes) {
                         val angle = 2.0 * Math.PI * i / strikes
                         val sLoc = arenaLoc.clone().add(cos(angle) * radius, 0.0, sin(angle) * radius)
-                        sLoc.y = (world.getHighestBlockYAt(sLoc) + 1).toDouble()
+                        sLoc.y = findArenaGroundY(sLoc, arenaLoc.y)
                         world.strikeLightningEffect(sLoc)
-                        world.spawnParticle(Particle.DUST_COLOR_TRANSITION, sLoc.clone().add(0.0, 0.5, 0.0), 25, 0.8, 0.5, 0.8, 0.0, deepRedTransition)
+                        world.spawnParticle(Particle.DUST_COLOR_TRANSITION, sLoc.clone().add(0.0, 0.5, 0.0), 20, 0.6, 0.5, 0.6, 0.0, deepRedTransition)
 
-                        sLoc.getNearbyPlayers(2.4).forEach { p ->
+                        sLoc.getNearbyPlayers(2.2).forEach { p ->
                             if (!p.isDead && (p.gameMode == GameMode.SURVIVAL || p.gameMode == GameMode.ADVENTURE)) {
                                 p.damage(5.0, armorIgnoreSource)
                                 if (applyWither) {
@@ -703,21 +1320,23 @@ class ActiveHerobrineFight(
             }
         }
 
-        runLater(startDelay + 75L) {
+        runLater(startDelay + 95L) {
             if (isDeadOrRemoved) return@runLater
-            val starCenter = (resolveCombatTarget() ?: return@runLater).location.clone()
-            starCenter.y = (world.getHighestBlockYAt(starCenter) + 1).toDouble()
-            val starPoints = buildFivePointedStarLocations(starCenter, starRadius = 9.0)
+            val targetLoc = resolveCombatTarget()?.location ?: spawnOrigin
+            val starCenter = targetLoc.clone().apply {
+                y = findArenaGroundY(this, targetLoc.y)
+            }
+            val starPoints = buildFivePointedStarLocations(starCenter, starRadius = 8.0)
 
             starPoints.forEach { pt ->
                 world.spawnParticle(Particle.DUST_COLOR_TRANSITION, pt.clone().add(0.0, 0.2, 0.0), 15, 0.3, 0.1, 0.3, 0.0, deepRedTransition)
             }
 
             starPoints.forEachIndexed { idx, strikePt ->
-                runLater(10L + idx * 8L) {
+                runLater(10L + idx * 7L) {
                     if (isDeadOrRemoved) return@runLater
                     val groundPt = strikePt.clone()
-                    groundPt.y = (world.getHighestBlockYAt(groundPt) + 1).toDouble()
+                    groundPt.y = findArenaGroundY(groundPt, starCenter.y)
 
                     world.strikeLightningEffect(groundPt)
                     world.playSound(groundPt, Sound.ENTITY_LIGHTNING_BOLT_IMPACT, SoundCategory.HOSTILE, 2.0f, 1.1f)
@@ -754,144 +1373,68 @@ class ActiveHerobrineFight(
         return tenPoints
     }
 
-    private fun performPhase3GuardianLaserAndRiptideSlam(fallbackTarget: Player) {
-        val eye = mannequin.location.add(0.0, 1.62, 0.0)
+    // ========================================================================
+    // 3-SECOND DELAYED SLAM TELEGRAPH & 3x3 SLAMS (PHASE 1, PHASE 2, PHASE 3)
+    // ========================================================================
 
-        val laserGuardians = mutableListOf<Guardian>()
-        val initialTargets = mannequin.location.getNearbyPlayers(32.0)
-            .filter { !it.isDead && (it.gameMode == GameMode.SURVIVAL || it.gameMode == GameMode.ADVENTURE) && mannequin.hasLineOfSight(it) }
-
-        for (p in initialTargets) {
-            val g = world.spawn(eye, Guardian::class.java, CreatureSpawnEvent.SpawnReason.CUSTOM) { guardian ->
-                guardian.persistentDataContainer.set(MobKeys.HEROBRINE_MINION, PersistentDataType.BYTE, 1)
-                guardian.isInvisible = true
-                guardian.isInvulnerable = true
-                guardian.isSilent = false
-                guardian.setAI(true)
-                guardian.setGravity(false)
-                guardian.target = p
-                guardian.setLaser(true)
-            }
-            laserGuardians.add(g)
+    private fun scheduleThreeSecondDelayedSlam(fallbackTarget: Player, isPhase3: Boolean) {
+        var lockedSlamLoc = (pickRandomOrSolePlayer() ?: fallbackTarget).location.clone().apply {
+            y = findArenaGroundY(this, this.y)
         }
 
-        var laserTick = 0
-        var laserTask: BukkitTask? = null
-        laserTask = runTimer(1L, 2L) {
-            laserTick += 2
-            if (isDeadOrRemoved || laserTick >= 40) {
-                laserTask?.cancel()
-                laserGuardians.forEach { it.remove() }
-                return@runTimer
+        runLater(30L) {
+            if (isDeadOrRemoved || !ensureLiveMannequin()) return@runLater
+            val chosen = pickRandomOrSolePlayer()
+                ?: fallbackTarget.takeIf { it.world == world && it.location.distanceSquared(spawnOrigin) <= config.maxCombatDistance * config.maxCombatDistance }
+            lockedSlamLoc = (chosen?.location?.clone() ?: spawnOrigin.clone()).apply {
+                y = findArenaGroundY(this, this.y)
             }
 
-            val currentOrigin = mannequin.location.add(0.0, 1.62, 0.0)
-            laserGuardians.forEach { if (it.isValid) it.teleport(currentOrigin) }
+            world.playSound(mannequin.location, Sound.BLOCK_RESPAWN_ANCHOR_CHARGE, SoundCategory.HOSTILE, 3.0f, 0.8f)
+            world.playSound(lockedSlamLoc, Sound.BLOCK_NOTE_BLOCK_PLING, SoundCategory.HOSTILE, 2.5f, 0.6f)
 
-            val pitch = 0.6f + (laserTick / 40.0f) * 1.4f
-            world.playSound(currentOrigin, Sound.ENTITY_GUARDIAN_ATTACK, SoundCategory.HOSTILE, 2.0f, pitch)
-        }
-
-        runLater(40L) {
-            laserGuardians.forEach { it.remove() }
-            if (isDeadOrRemoved || !mannequin.isValid) return@runLater
-
-            val validPlayers = mannequin.location.getNearbyPlayers(32.0)
-                .filter { !it.isDead && (it.gameMode == GameMode.SURVIVAL || it.gameMode == GameMode.ADVENTURE) && mannequin.hasLineOfSight(it) }
-
-            for (p in validPlayers) {
-                launchRiptidingSteveMissile(p)
-            }
-
-            runLater(28L) {
-                if (isDeadOrRemoved || !mannequin.isValid) return@runLater
-                val slamTarget = pickRandomOrSolePlayer() ?: fallbackTarget
-                executePhase3FinalSlam(slamTarget.location)
-            }
-        }
-    }
-
-    @Suppress("UnstableApiUsage")
-    private fun launchRiptidingSteveMissile(target: Player) {
-        val origin = mannequin.location.add(0.0, 1.2, 0.0)
-        world.playSound(origin, Sound.ITEM_TRIDENT_RIPTIDE_3, SoundCategory.HOSTILE, 2.5f, 1.0f)
-
-        val steveMissile = world.spawn(origin, Mannequin::class.java, CreatureSpawnEvent.SpawnReason.CUSTOM) { m ->
-            m.persistentDataContainer.set(MobKeys.HEROBRINE_MINION, PersistentDataType.BYTE, 1)
-            m.profile = io.papermc.paper.datacomponent.item.ResolvableProfile.resolvableProfile()
-                .uuid(UUID.randomUUID())
-                .name("Steve")
-                .build()
-            m.customName("<aqua>Steve</aqua>".mm())
-            m.description = null
-            m.isInvulnerable = true
-            m.isImmovable = false
-            m.setGravity(false)
-            m.pose = Pose.SPIN_ATTACK
-            m.equipment.setItemInMainHand(ItemStack(Material.TRIDENT))
-        }
-
-        val unblockableSource = DamageSource.builder(DamageType.SONIC_BOOM)
-            .withCausingEntity(mannequin)
-            .withDirectEntity(steveMissile)
-            .build()
-
-        var ticks = 0
-        var missileTask: BukkitTask? = null
-        missileTask = runTimer(1L, 1L) {
-            ticks++
-            if (isDeadOrRemoved || !steveMissile.isValid || ticks > 45 || !target.isValid || target.isDead) {
-                steveMissile.remove()
-                missileTask?.cancel()
-                return@runTimer
-            }
-
-            val targetCenter = target.location.add(0.0, 1.0, 0.0)
-            val dir = targetCenter.toVector().subtract(steveMissile.location.toVector())
-            val distSq = dir.lengthSquared()
-
-            if (distSq > 1e-4) {
-                val step = dir.clone().normalize().multiply(1.6)
-                val nextLoc = steveMissile.location.add(step)
-                nextLoc.setDirection(step)
-                steveMissile.teleport(nextLoc)
-                steveMissile.pose = Pose.SPIN_ATTACK
-            }
-
-            world.spawnParticle(Particle.SPLASH, steveMissile.location, 8, 0.2, 0.2, 0.2, 0.1)
-            world.spawnParticle(Particle.ELECTRIC_SPARK, steveMissile.location, 4, 0.2, 0.2, 0.2, 0.05)
-
-            if (distSq <= 3.24 || !steveMissile.location.block.isPassable) {
-                val impactLoc = steveMissile.location.clone()
-                world.strikeLightningEffect(impactLoc)
-                world.playSound(impactLoc, Sound.ENTITY_GENERIC_EXPLODE, SoundCategory.HOSTILE, 2.5f, 0.9f)
-                world.spawnParticle(Particle.EXPLOSION_EMITTER, impactLoc, 1)
-
-                if (target.location.distanceSquared(impactLoc) <= 9.0) {
-                    target.damage(10.0, unblockableSource)
+            var telegraphTick = 0
+            var telegraphTask: BukkitTask? = null
+            telegraphTask = runTimer(1L, 2L) {
+                telegraphTick += 2
+                if (isDeadOrRemoved || telegraphTick >= 30) {
+                    telegraphTask?.cancel()
+                    return@runTimer
                 }
+                for (i in 0 until 24) {
+                    val angle = 2.0 * Math.PI * i / 24
+                    val ringPt = lockedSlamLoc.clone().add(cos(angle) * slamRadius, 0.15, sin(angle) * slamRadius)
+                    world.spawnParticle(Particle.DUST_COLOR_TRANSITION, ringPt, 2, 0.05, 0.05, 0.05, 0.0, deepRedTransition)
+                }
+            }
+        }
 
-                steveMissile.remove()
-                missileTask?.cancel()
+        runLater(60L) {
+            if (isDeadOrRemoved || !ensureLiveMannequin()) return@runLater
+            if (isPhase3) {
+                executePhase3FinalSlam(lockedSlamLoc)
+            } else {
+                executePhase2InstantLightningSlam(lockedSlamLoc)
             }
         }
     }
 
     private fun executePhase3FinalSlam(targetLocation: Location) {
+        if (isDeadOrRemoved || !ensureLiveMannequin()) return
         isFloatingInvulnerable = false
         isSlamming = false
         usingRangedStance = false
         stanceSwitchTicks = 0
 
         val slamLoc = targetLocation.clone()
-        slamLoc.y = (world.getHighestBlockYAt(slamLoc) + 1).toDouble()
+        slamLoc.y = findArenaGroundY(slamLoc, targetLocation.y)
 
         mannequin.setGravity(true)
         mannequin.teleport(slamLoc)
         mannequin.equipment.setItemInMainHand(ItemStack(Material.NETHERITE_SWORD))
 
         world.strikeLightningEffect(slamLoc)
-        terraformSlamArea(slamLoc, slamRadius.toInt())
+        terraformSlamArea(slamLoc, slamBlockHalfSize)
 
         world.playSound(slamLoc, Sound.ENTITY_LIGHTNING_BOLT_THUNDER, SoundCategory.HOSTILE, 4.0f, 0.7f)
         world.playSound(slamLoc, Sound.ITEM_MACE_SMASH_GROUND_HEAVY, SoundCategory.HOSTILE, 4.0f, 0.7f)
@@ -904,7 +1447,7 @@ class ActiveHerobrineFight(
             .withDirectEntity(mannequin)
             .build()
 
-        slamLoc.getNearbyLivingEntities(slamRadius, 5.0, slamRadius).forEach { victim ->
+        slamLoc.getNearbyLivingEntities(slamRadius, 3.5, slamRadius).forEach { victim ->
             if (victim == mannequin) return@forEach
             if (victim.persistentDataContainer.has(MobKeys.HEROBRINE_MINION, PersistentDataType.BYTE)) return@forEach
             if (victim is Player && (victim.isDead || (victim.gameMode != GameMode.SURVIVAL && victim.gameMode != GameMode.ADVENTURE))) {
@@ -923,105 +1466,45 @@ class ActiveHerobrineFight(
         }
     }
 
-    private fun chargeAndThrowChannelingTrident(target: Player) {
-        val tridentStack = ItemStack(Material.TRIDENT).apply {
-            editMeta { it.addEnchant(Enchantment.CHANNELING, 1, true) }
-        }
-        mannequin.equipment.setItemInMainHand(tridentStack)
-        world.playSound(mannequin.location, Sound.ITEM_TRIDENT_THUNDER, SoundCategory.HOSTILE, 3.0f, 1.2f)
-
-        var chargeTick = 0
-        var chargeTask: BukkitTask? = null
-        chargeTask = runTimer(1L, 2L) {
-            chargeTick += 2
-            if (isDeadOrRemoved || chargeTick >= 25) {
-                chargeTask?.cancel()
-                return@runTimer
-            }
-            faceLocation(target.eyeLocation)
-            world.spawnParticle(
-                Particle.DUST_COLOR_TRANSITION,
-                mannequin.location.add(0.0, 1.5, 0.0),
-                12, 0.5, 0.5, 0.5, 0.0,
-                deepRedTransition
-            )
-        }
-
-        runLater(26L) {
-            if (isDeadOrRemoved || !mannequin.isValid) return@runLater
-            mannequin.swingMainHand()
-            mannequin.equipment.setItemInMainHand(ItemStack(Material.AIR))
-
-            val eye = mannequin.location.add(0.0, 1.62, 0.0)
-            val throwDir = target.eyeLocation.toVector().subtract(eye.toVector()).normalize()
-            world.playSound(eye, Sound.ITEM_TRIDENT_THROW, SoundCategory.HOSTILE, 2.5f, 0.9f)
-
-            val trident = world.spawn(eye.add(throwDir), Trident::class.java, CreatureSpawnEvent.SpawnReason.CUSTOM) { t ->
-                t.shooter = mannequin
-                t.itemStack = tridentStack
-                t.velocity = throwDir.multiply(2.2)
-                t.damage = 0.0
-                t.pickupStatus = AbstractArrow.PickupStatus.DISALLOWED
-                t.persistentDataContainer.set(MobKeys.HEROBRINE_TRIDENT, PersistentDataType.BYTE, 1)
-            }
-
-            var flightTicks = 0
-            var watchTask: BukkitTask? = null
-            watchTask = runTimer(1L, 1L) {
-                flightTicks++
-                if (isDeadOrRemoved || !trident.isValid || trident.isDead) {
-                    watchTask?.cancel()
-                    return@runTimer
-                }
-                world.spawnParticle(Particle.DUST_COLOR_TRANSITION, trident.location, 3, 0.1, 0.1, 0.1, 0.0, deepRedTransition)
-
-                if (flightTicks > 60) {
-                    watchTask?.cancel()
-                    val impactLoc = trident.location.clone()
-                    trident.remove()
-                    executePhase2InstantLightningSlam(impactLoc)
-                }
-            }
-        }
-    }
-
     fun executePhase2InstantLightningSlam(impactLocation: Location) {
-        if (isDeadOrRemoved || !mannequin.isValid) return
+        if (isDeadOrRemoved || !ensureLiveMannequin()) return
+        if (!isFloatingInvulnerable && !isSlamming) return
+
         isFloatingInvulnerable = false
         isSlamming = false
         usingRangedStance = false
         stanceSwitchTicks = 0
 
         val slamLoc = impactLocation.clone()
-        slamLoc.y = (world.getHighestBlockYAt(slamLoc) + 1).toDouble()
+        slamLoc.y = findArenaGroundY(slamLoc, impactLocation.y)
 
         mannequin.setGravity(true)
         mannequin.teleport(slamLoc)
         mannequin.equipment.setItemInMainHand(ItemStack(Material.DIAMOND_SWORD))
 
         world.strikeLightningEffect(slamLoc)
-        terraformSlamArea(slamLoc, slamRadius.toInt())
+        terraformSlamArea(slamLoc, slamBlockHalfSize)
 
         world.playSound(slamLoc, Sound.ENTITY_LIGHTNING_BOLT_THUNDER, SoundCategory.HOSTILE, 4.0f, 0.7f)
         world.playSound(slamLoc, Sound.ITEM_MACE_SMASH_GROUND_HEAVY, SoundCategory.HOSTILE, 4.0f, 0.7f)
         world.playSound(slamLoc, Sound.ENTITY_GENERIC_EXPLODE, SoundCategory.HOSTILE, 3.0f, 0.75f)
 
-        world.spawnParticle(Particle.GUST_EMITTER_LARGE, slamLoc.clone().add(0.0, 0.4, 0.0), 4, 1.5, 0.2, 1.5, 0.0)
+        world.spawnParticle(Particle.GUST_EMITTER_LARGE, slamLoc.clone().add(0.0, 0.4, 0.0), 2, 0.8, 0.2, 0.8, 0.0)
         world.spawnParticle(
             Particle.BLOCK,
             slamLoc.clone().add(0.0, 0.5, 0.0),
-            120, 2.5, 0.4, 2.5, 0.15,
+            60, 1.2, 0.4, 1.2, 0.15,
             Material.REDSTONE_BLOCK.createBlockData()
         )
 
-        for (wave in 1..4) {
-            val r = (slamRadius / 4.0) * wave
+        for (wave in 1..2) {
+            val r = (slamRadius / 2.0) * wave
             runLater((wave * 2).toLong()) {
-                val points = (r * 10).toInt().coerceAtLeast(16)
+                val points = 16
                 for (i in 0 until points) {
                     val angle = 2.0 * Math.PI * i / points
                     val pt = slamLoc.clone().add(cos(angle) * r, 0.2, sin(angle) * r)
-                    world.spawnParticle(Particle.DUST_COLOR_TRANSITION, pt, 3, 0.15, 0.05, 0.15, 0.0, deepRedTransition)
+                    world.spawnParticle(Particle.DUST_COLOR_TRANSITION, pt, 2, 0.1, 0.05, 0.1, 0.0, deepRedTransition)
                 }
             }
         }
@@ -1032,7 +1515,7 @@ class ActiveHerobrineFight(
             .withDirectEntity(mannequin)
             .build()
 
-        slamLoc.getNearbyLivingEntities(slamRadius, 5.0, slamRadius).forEach { victim ->
+        slamLoc.getNearbyLivingEntities(slamRadius, 3.5, slamRadius).forEach { victim ->
             if (victim == mannequin) return@forEach
             if (victim.persistentDataContainer.has(MobKeys.HEROBRINE_MINION, PersistentDataType.BYTE)) return@forEach
             if (victim is Player && (victim.isDead || (victim.gameMode != GameMode.SURVIVAL && victim.gameMode != GameMode.ADVENTURE))) {
@@ -1056,8 +1539,14 @@ class ActiveHerobrineFight(
         isSlamming = true
         currentTarget = target
 
-        val slamTargetLoc = target.location.clone()
-        slamTargetLoc.y = (world.getHighestBlockYAt(slamTargetLoc) + 1).toDouble()
+        val slamTargetLoc = if (target.world == world &&
+            target.location.distanceSquared(spawnOrigin) <= config.maxCombatDistance * config.maxCombatDistance
+        ) {
+            target.location.clone()
+        } else {
+            spawnOrigin.clone()
+        }
+        slamTargetLoc.y = findArenaGroundY(slamTargetLoc, slamTargetLoc.y)
 
         world.playSound(mannequin.location, Sound.BLOCK_RESPAWN_ANCHOR_CHARGE, SoundCategory.HOSTILE, 3.0f, 0.7f)
         world.playSound(slamTargetLoc, Sound.BLOCK_NOTE_BLOCK_PLING, SoundCategory.HOSTILE, 2.5f, 0.5f)
@@ -1070,55 +1559,55 @@ class ActiveHerobrineFight(
                 telegraphTask?.cancel()
                 return@runTimer
             }
-            for (i in 0 until 48) {
-                val angle = 2.0 * Math.PI * i / 48
+            for (i in 0 until 24) {
+                val angle = 2.0 * Math.PI * i / 24
                 val ringPt = slamTargetLoc.clone().add(cos(angle) * slamRadius, 0.15, sin(angle) * slamRadius)
                 world.spawnParticle(Particle.DUST, ringPt, 2, 0.05, 0.05, 0.05, 0.0, redstoneDust)
             }
             val innerR = slamRadius * (1.0 - (telegraphTick / 30.0))
-            for (i in 0 until 24) {
-                val angle = 2.0 * Math.PI * i / 24
+            for (i in 0 until 12) {
+                val angle = 2.0 * Math.PI * i / 12
                 val innerPt = slamTargetLoc.clone().add(cos(angle) * innerR, 0.15, sin(angle) * innerR)
                 world.spawnParticle(Particle.DUST, innerPt, 1, 0.0, 0.0, 0.0, 0.0, redstoneDust)
             }
         }
 
         runLater(30L) {
-            if (isDeadOrRemoved || !mannequin.isValid) return@runLater
+            if (isDeadOrRemoved || !ensureLiveMannequin()) return@runLater
             mannequin.setGravity(true)
             val plungeVec = slamTargetLoc.toVector().subtract(mannequin.location.toVector())
             mannequin.velocity = plungeVec.multiply(0.18).setY(-1.4)
 
             runLater(10L) {
-                if (isDeadOrRemoved || !mannequin.isValid) return@runLater
+                if (isDeadOrRemoved || !ensureLiveMannequin()) return@runLater
                 mannequin.teleport(slamTargetLoc)
                 isSlamming = false
                 usingRangedStance = false
                 stanceSwitchTicks = 0
                 mannequin.equipment.setItemInMainHand(ItemStack(Material.IRON_SWORD))
 
-                terraformSlamArea(slamTargetLoc, slamRadius.toInt())
+                terraformSlamArea(slamTargetLoc, slamBlockHalfSize)
 
                 world.playSound(slamTargetLoc, Sound.ITEM_MACE_SMASH_GROUND_HEAVY, SoundCategory.HOSTILE, 3.5f, 0.75f)
                 world.playSound(slamTargetLoc, Sound.ENTITY_GENERIC_EXPLODE, SoundCategory.HOSTILE, 2.5f, 0.8f)
 
-                world.spawnParticle(Particle.GUST_EMITTER_LARGE, slamTargetLoc.clone().add(0.0, 0.4, 0.0), 3, 1.5, 0.2, 1.5, 0.0)
-                world.spawnParticle(Particle.DUST_PLUME, slamTargetLoc.clone().add(0.0, 0.2, 0.0), 90, 3.0, 0.3, 3.0, 0.06)
+                world.spawnParticle(Particle.GUST_EMITTER_LARGE, slamTargetLoc.clone().add(0.0, 0.4, 0.0), 2, 0.8, 0.2, 0.8, 0.0)
+                world.spawnParticle(Particle.DUST_PLUME, slamTargetLoc.clone().add(0.0, 0.2, 0.0), 45, 1.2, 0.3, 1.2, 0.06)
                 world.spawnParticle(
                     Particle.BLOCK,
                     slamTargetLoc.clone().add(0.0, 0.5, 0.0),
-                    100, 2.5, 0.4, 2.5, 0.15,
+                    60, 1.2, 0.4, 1.2, 0.15,
                     Material.REDSTONE_BLOCK.createBlockData()
                 )
 
-                for (wave in 1..4) {
-                    val r = (slamRadius / 4.0) * wave
+                for (wave in 1..2) {
+                    val r = (slamRadius / 2.0) * wave
                     runLater((wave * 2).toLong()) {
-                        val points = (r * 10).toInt().coerceAtLeast(16)
+                        val points = 16
                         for (i in 0 until points) {
                             val angle = 2.0 * Math.PI * i / points
                             val pt = slamTargetLoc.clone().add(cos(angle) * r, 0.2, sin(angle) * r)
-                            world.spawnParticle(Particle.DUST, pt, 3, 0.15, 0.05, 0.15, 0.0, redstoneDust)
+                            world.spawnParticle(Particle.DUST, pt, 2, 0.1, 0.05, 0.1, 0.0, redstoneDust)
                         }
                     }
                 }
@@ -1129,7 +1618,7 @@ class ActiveHerobrineFight(
                     .withDirectEntity(mannequin)
                     .build()
 
-                slamTargetLoc.getNearbyLivingEntities(slamRadius, 5.0, slamRadius).forEach { victim ->
+                slamTargetLoc.getNearbyLivingEntities(slamRadius, 3.5, slamRadius).forEach { victim ->
                     if (victim == mannequin) return@forEach
                     if (victim.persistentDataContainer.has(MobKeys.HEROBRINE_MINION, PersistentDataType.BYTE)) return@forEach
                     if (victim is Player && (victim.isDead || (victim.gameMode != GameMode.SURVIVAL && victim.gameMode != GameMode.ADVENTURE))) {
@@ -1150,14 +1639,11 @@ class ActiveHerobrineFight(
         }
     }
 
-    private fun terraformSlamArea(center: Location, radius: Int) {
-        val radiusSq = radius * radius
+    private fun terraformSlamArea(center: Location, halfSize: Int) {
         val centerBlock = center.block
 
-        for (x in -radius..radius) {
-            for (z in -radius..radius) {
-                if ((x * x + z * z) > radiusSq) continue
-
+        for (x in -halfSize..halfSize) {
+            for (z in -halfSize..halfSize) {
                 for (y in -2..1) {
                     val ground = centerBlock.getRelative(x, y, z)
                     if (ground.type == Material.GRASS_BLOCK ||
@@ -1202,6 +1688,7 @@ class ActiveHerobrineFight(
         isDyingAnimation = true
         isFloatingInvulnerable = true
 
+        ensureLiveMannequin()
         tasks.forEach { it.cancel() }
         tasks.clear()
         activeSteves.forEach { if (it.mannequin.isValid) it.mannequin.remove() }
@@ -1209,18 +1696,24 @@ class ActiveHerobrineFight(
 
         mannequin.health = 1.0
         mannequin.setGravity(false)
-        mannequin.isInvulnerable = true
+        mannequin.setInvulnerable(true)
         mannequin.equipment.setItemInMainHand(ItemStack(Material.AIR))
 
         val baseGroundLoc = mannequin.location.clone()
+        baseGroundLoc.y = findArenaGroundY(baseGroundLoc, spawnOrigin.y)
         world.playSound(baseGroundLoc, Sound.ENTITY_ENDER_DRAGON_DEATH, SoundCategory.HOSTILE, 5.0f, 0.85f)
 
+        var lastAscendLoc = mannequin.location.clone()
         var tick = 0
         var deathTask: BukkitTask? = null
         deathTask = Bukkit.getScheduler().runTaskTimer(plugin, Runnable {
             tick++
-            if (!mannequin.isValid || tick > 120) {
+            if (!ensureLiveMannequin() || tick >= 120) {
                 deathTask?.cancel()
+                if (mannequin.isValid) {
+                    lastAscendLoc = mannequin.location.clone()
+                }
+                completeHerobrineDeath(lastAscendLoc, killer)
                 return@Runnable
             }
 
@@ -1228,17 +1721,19 @@ class ActiveHerobrineFight(
             nextLoc.yaw += 14f
             nextLoc.pitch = -35f
             mannequin.teleport(nextLoc)
+            lastAscendLoc = nextLoc.clone()
             HerobrinePacketController.broadcastHeadRotation(mannequin.entityId, world.players, nextLoc.yaw, nextLoc.pitch)
 
             if (tick % 6 == 0) {
                 val lx = baseGroundLoc.x + Random.nextDouble(-14.0, 14.0)
                 val lz = baseGroundLoc.z + Random.nextDouble(-14.0, 14.0)
-                val ly = world.getHighestBlockYAt(lx.toInt(), lz.toInt()) + 1.0
-                world.strikeLightningEffect(Location(world, lx, ly, lz))
+                val strikeCandidate = Location(world, lx, baseGroundLoc.y, lz)
+                strikeCandidate.y = findArenaGroundY(strikeCandidate, baseGroundLoc.y)
+                world.strikeLightningEffect(strikeCandidate)
             }
 
             if (tick % 2 == 0) {
-                spawnRainbowGroundAura(baseGroundLoc, radius = 8.0, count = 20)
+                tickPhaseArenaAura(baseGroundLoc)
             }
 
             if (tick == 85) {
@@ -1254,57 +1749,55 @@ class ActiveHerobrineFight(
 
             if (tick >= 85) {
                 world.spawnParticle(Particle.END_ROD, mannequin.location.add(0.0, 1.0, 0.0), 15, 0.6, 0.8, 0.6, 0.15)
-                world.spawnParticle(Particle.FLASH, mannequin.location.add(0.0, 1.0, 0.0), 1)
-            }
-
-            if (tick == 120) {
-                deathTask?.cancel()
-                completeHerobrineDeath(mannequin.location.clone(), killer)
+                world.spawnParticle(Particle.FLASH, mannequin.location.add(0.0, 1.0, 0.0), 1, 0.0, 0.0, 0.0, 0.0, Color.WHITE)
             }
         }, 1L, 1L)
     }
 
     private fun completeHerobrineDeath(finalAscensionLoc: Location, killer: Player?) {
-        world.playSound(finalAscensionLoc, Sound.ENTITY_GENERIC_EXPLODE, SoundCategory.HOSTILE, 4.0f, 0.7f)
-        world.playSound(finalAscensionLoc, Sound.UI_TOAST_CHALLENGE_COMPLETE, SoundCategory.PLAYERS, 2.0f, 1.0f)
-        world.spawnParticle(Particle.EXPLOSION_EMITTER, finalAscensionLoc, 2)
-        world.spawnParticle(Particle.FLASH, finalAscensionLoc, 4)
-        world.spawnParticle(Particle.END_ROD, finalAscensionLoc, 200, 2.0, 2.0, 2.0, 0.35)
+        try {
+            world.playSound(finalAscensionLoc, Sound.ENTITY_GENERIC_EXPLODE, SoundCategory.HOSTILE, 4.0f, 0.7f)
+            world.playSound(finalAscensionLoc, Sound.UI_TOAST_CHALLENGE_COMPLETE, SoundCategory.PLAYERS, 2.0f, 1.0f)
+            world.spawnParticle(Particle.EXPLOSION_EMITTER, finalAscensionLoc, 2)
+            world.spawnParticle(Particle.FLASH, finalAscensionLoc, 4, 0.0, 0.0, 0.0, 0.0, Color.WHITE)
+            world.spawnParticle(Particle.END_ROD, finalAscensionLoc, 200, 2.0, 2.0, 2.0, 0.35)
 
-        // Drop 32 Enchanted Golden Apples + "The Hero's Tunneler" Trophy Pickaxe
-        val dropLoc = spawnOrigin.clone().add(0.0, 1.2, 0.0)
-        val rewards = listOf(
-            ItemStack(Material.ENCHANTED_GOLDEN_APPLE, 32),
-            plugin.herobrineManager.createHerosTunneler()
-        )
-        for (stack in rewards) {
-            world.dropItemNaturally(dropLoc, stack) { item ->
-                item.isGlowing = true
-                item.isInvulnerable = true
-                item.velocity = Vector(0.0, 0.35, 0.0)
+            // Guaranteed drops right at Herobrine's actual death location floor
+            val dropFloorY = findArenaGroundY(finalAscensionLoc, spawnOrigin.y)
+            val dropLoc = Location(world, finalAscensionLoc.x, dropFloorY + 0.8, finalAscensionLoc.z)
+
+            val rewards = listOf(
+                ItemStack(Material.ENCHANTED_GOLDEN_APPLE, 32),
+                plugin.herobrineManager.createHerosTunneler()
+            )
+            for (stack in rewards) {
+                world.dropItemNaturally(dropLoc, stack) { item ->
+                    item.isGlowing = true
+                    item.setInvulnerable(true)
+                    item.isUnlimitedLifetime = true
+                    item.velocity = Vector(0.0, 0.35, 0.0)
+                }
             }
+
+            ExperienceUtil.spawnLevelOrbs(dropLoc, levels = config.expLevelsDropped, orbCount = 30)
+
+            val killerName = killer?.name ?: "A player"
+            Bukkit.broadcast("<white>$killerName has slain Herobrine.</white>".mm())
+            DiscordSrvHook.sendHerobrineSlainByPlayer(killerName, killer?.uniqueId)
+
+            Bukkit.getScheduler().runTaskLater(plugin, Runnable {
+                Bukkit.broadcast("<yellow>Herobrine has left the game.</yellow>".mm())
+                DiscordSrvHook.sendLeaveMessage()
+                HerobrinePacketController.broadcastTablistRemove(tablistUuid)
+            }, 20L)
+        } finally {
+            forceCleanup(killEntity = true, removeTablistImmediately = false)
+            plugin.herobrineManager.activeFights.remove(mannequinId)
         }
-
-        // Drop configured 500 levels of EXP
-        ExperienceUtil.spawnLevelOrbs(dropLoc, levels = config.expLevelsDropped, orbCount = 30)
-
-        val killerName = killer?.name ?: "A player"
-        Bukkit.broadcast("<white>$killerName has slain Herobrine.</white>".mm())
-        DiscordSrvHook.sendHerobrineSlainByPlayer(killerName)
-
-        Bukkit.getScheduler().runTaskLater(plugin, Runnable {
-            Bukkit.broadcast("<yellow>Herobrine has left the game.</yellow>".mm())
-            DiscordSrvHook.sendLeaveMessage()
-            HerobrinePacketController.broadcastTablistRemove(tablistUuid)
-        }, 20L)
-
-        val id = mannequin.uniqueId
-        forceCleanup(killEntity = true, removeTablistImmediately = false)
-        plugin.herobrineManager.activeFights.remove(id)
     }
 
     // ========================================================================
-    // DAMAGE & PHASE CHECKS
+    // DAMAGE, ARENA FLOOR FINDER & PHASE CHECKS
     // ========================================================================
 
     fun onDamaged(damageAmount: Double, attacker: Player?) {
@@ -1313,13 +1806,11 @@ class ActiveHerobrineFight(
             currentTarget = attacker
         }
 
-        // 1. Check 1000 HP mark (Phase 1 -> Phase 2)
         if (currentPhase == 1 && mannequin.health <= config.phase2Threshold) {
             enterPhase2()
             return
         }
 
-        // 2. Check 500 HP mark (Phase 2 -> Phase 3)
         if (currentPhase == 2 && mannequin.health <= config.phase3Threshold) {
             enterPhase3()
             return
@@ -1334,24 +1825,49 @@ class ActiveHerobrineFight(
         }
     }
 
+    private fun findArenaGroundY(loc: Location, referenceY: Double = spawnOrigin.y): Double {
+        val baseBlock = Location(world, loc.x, referenceY, loc.z).block
+        for (dy in 5 downTo -12) {
+            val ground = baseBlock.getRelative(0, dy - 1, 0)
+            val feet = baseBlock.getRelative(0, dy, 0)
+            val head = baseBlock.getRelative(0, dy + 1, 0)
+            if (ground.type.isSolid && !ground.isLiquid && feet.isPassable && head.isPassable) {
+                return feet.y.toDouble()
+            }
+        }
+        return referenceY
+    }
+
     private fun pickRandomOrSolePlayer(): Player? {
+        val maxDistSq = config.maxCombatDistance * config.maxCombatDistance
         val players = mannequin.location.getNearbyPlayers(config.followRange)
-            .filter { !it.isDead && (it.gameMode == GameMode.SURVIVAL || it.gameMode == GameMode.ADVENTURE) }
+            .filter {
+                !it.isDead &&
+                        (it.gameMode == GameMode.SURVIVAL || it.gameMode == GameMode.ADVENTURE) &&
+                        it.location.distanceSquared(spawnOrigin) <= maxDistSq
+            }
         return players.randomOrNull()
     }
 
     private fun resolveSummonerOrNearest(): Player? {
+        val maxDistSq = config.maxCombatDistance * config.maxCombatDistance
         summonerId?.let { id ->
             val p = Bukkit.getPlayer(id)
-            if (p != null && p.isOnline && !p.isDead && p.world == world) return p
+            if (p != null && p.isOnline && !p.isDead && p.world == world &&
+                p.location.distanceSquared(spawnOrigin) <= maxDistSq
+            ) {
+                return p
+            }
         }
         return pickRandomOrSolePlayer()
     }
 
     private fun resolveCombatTarget(): Player? {
+        val maxDistSq = config.maxCombatDistance * config.maxCombatDistance
         val cur = currentTarget
         if (cur != null && cur.isOnline && !cur.isDead && cur.world == world &&
-            (cur.gameMode == GameMode.SURVIVAL || cur.gameMode == GameMode.ADVENTURE)
+            (cur.gameMode == GameMode.SURVIVAL || cur.gameMode == GameMode.ADVENTURE) &&
+            cur.location.distanceSquared(spawnOrigin) <= maxDistSq
         ) {
             return cur
         }
@@ -1390,14 +1906,26 @@ class ActiveHerobrineFight(
 
         herobrineTeam?.unregister()
         herobrineTeam = null
+        steveTeam?.unregister()
+        steveTeam = null
 
         activeSteves.forEach { if (it.mannequin.isValid) it.mannequin.remove() }
         activeSteves.clear()
 
-        if (::mannequin.isInitialized) {
-            plugin.bossBarManager.unregisterEntity(mannequin)
-            if (killEntity && mannequin.isValid) {
-                mannequin.remove()
+        world.entities.forEach { ent ->
+            if (ent.persistentDataContainer.has(MobKeys.HEROBRINE_MINION, PersistentDataType.BYTE)) {
+                ent.remove()
+            }
+        }
+
+        if (::mannequinId.isInitialized) {
+            plugin.bossBarManager.unregisterById(mannequinId)
+            if (killEntity) {
+                if (::mannequin.isInitialized && mannequin.isValid) {
+                    mannequin.remove()
+                } else {
+                    (Bukkit.getEntity(mannequinId) as? Mannequin)?.remove()
+                }
             }
         }
         if (removeTablistImmediately) {

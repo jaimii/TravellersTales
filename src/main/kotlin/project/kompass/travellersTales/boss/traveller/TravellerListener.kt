@@ -88,16 +88,23 @@ class TravellerListener(private val manager: TravellerManager) : Listener {
         val damagedFight = manager.getFight(event.entity)
         if (damagedFight != null) {
             val rawDamager = event.damager
+            val attacker: LivingEntity? = when (rawDamager) {
+                is LivingEntity -> rawDamager
+                is Projectile -> rawDamager.shooter as? LivingEntity
+                else -> null
+            }
 
             // Arrow Handling (75% reduction + 35% shield deflection if not piercing)
             if (rawDamager is AbstractArrow) {
                 if (damagedFight.isShieldActive() && isFrontalHit(damagedFight.entity, rawDamager)) {
                     if (rawDamager.pierceLevel == 0 && Random.nextDouble() < damagedFight.config.shieldBlockChance) {
                         event.isCancelled = true
+                        damagedFight.entity.swingOffHand()
                         damagedFight.world.playSound(damagedFight.entity.location, Sound.ITEM_SHIELD_BLOCK, 1.5f, 1.0f)
                         damagedFight.world.spawnParticle(Particle.CRIT, rawDamager.location, 12, 0.2, 0.2, 0.2, 0.1)
                         damagedFight.world.spawnParticle(Particle.ELECTRIC_SPARK, rawDamager.location, 10, 0.2, 0.2, 0.2, 0.05)
                         rawDamager.velocity = rawDamager.velocity.multiply(-0.2)
+                        damagedFight.onDamaged(attacker)
                         return
                     }
                 }
@@ -105,12 +112,6 @@ class TravellerListener(private val manager: TravellerManager) : Listener {
             }
 
             // Axe Guard Break & Immediate Retaliatory Shield Bash
-            val attacker: LivingEntity? = when (rawDamager) {
-                is LivingEntity -> rawDamager
-                is Projectile -> rawDamager.shooter as? LivingEntity
-                else -> null
-            }
-
             if (attacker != null && isAxeAttack(attacker) && isFrontalHit(damagedFight.entity, attacker)) {
                 if (damagedFight.isShieldActive()) {
                     damagedFight.disableShield(damagedFight.config.shieldDisableTicks)

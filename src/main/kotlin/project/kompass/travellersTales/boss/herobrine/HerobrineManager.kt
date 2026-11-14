@@ -3,6 +3,7 @@ package project.kompass.travellersTales.boss.herobrine
 import org.bukkit.*
 import org.bukkit.block.Block
 import org.bukkit.entity.Entity
+import org.bukkit.entity.Mannequin
 import org.bukkit.entity.Player
 import org.bukkit.inventory.ItemRarity
 import org.bukkit.inventory.ItemStack
@@ -33,7 +34,18 @@ class HerobrineManager(private val plugin: TravellersTales) {
      * Returns true if a Herobrine boss is currently active in ANY world or dimension on the server.
      */
     fun isHerobrineActiveAnywhere(): Boolean {
-        return activeFights.values.any { !it.isDeadOrRemoved && it.mannequin.isValid && !it.mannequin.isDead }
+        return activeFights.values.any { !it.isDeadOrRemoved && !it.mannequin.isDead }
+    }
+
+    fun isHerobrineEntity(entity: Entity): Boolean {
+        return entity is Mannequin &&
+                entity.persistentDataContainer.get(MobKeys.MOB_ID, PersistentDataType.STRING) == "herobrine"
+    }
+
+    fun rebindHerobrineIfTracked(mannequin: Mannequin): ActiveHerobrineFight? {
+        val fight = activeFights[mannequin.uniqueId] ?: return null
+        fight.rebindMannequin(mannequin)
+        return fight
     }
 
     /**
@@ -42,14 +54,12 @@ class HerobrineManager(private val plugin: TravellersTales) {
      * - Layer Y-1: 3x3 ring of 8 GOLD_BLOCKs around a GOLD_BLOCK or MOSSY_COBBLESTONE center
      */
     fun tryActivateShrine(netherrackBlock: Block, player: Player): Boolean {
-        // 1. Server-wide Singleton Rule: Do nothing at all if Herobrine is already active anywhere
         if (isHerobrineActiveAnywhere()) {
             return false
         }
 
         if (netherrackBlock.type != Material.NETHERRACK) return false
 
-        // 2. Check 4 cardinal Redstone Torches around the Netherrack
         val torches = listOf(
             netherrackBlock.getRelative(1, 0, 0),
             netherrackBlock.getRelative(-1, 0, 0),
@@ -60,7 +70,6 @@ class HerobrineManager(private val plugin: TravellersTales) {
             return false
         }
 
-        // 3. Check 3x3 Gold Block base at Y - 1
         val baseCenter = netherrackBlock.getRelative(0, -1, 0)
         if (baseCenter.type != Material.GOLD_BLOCK && baseCenter.type != Material.MOSSY_COBBLESTONE) {
             return false
@@ -76,7 +85,6 @@ class HerobrineManager(private val plugin: TravellersTales) {
             return false
         }
 
-        // 4. Verify the player has slain all 7 required bosses via BossKillTracker
         if (!BossKillTracker.hasKilledAllBosses(player)) {
             val missing = BossKillTracker.REQUIRED_BOSS_IDS - BossKillTracker.getSlainBosses(player)
             val formattedMissing = missing.joinToString(", ") { id ->
@@ -89,7 +97,6 @@ class HerobrineManager(private val plugin: TravellersTales) {
             return false
         }
 
-        // 5. Shatter the shrine with lightning and spawn Herobrine in the center
         val world = netherrackBlock.world
         val shrineBlocks = mutableListOf<Block>().apply {
             add(netherrackBlock)
@@ -127,9 +134,6 @@ class HerobrineManager(private val plugin: TravellersTales) {
         return fight
     }
 
-    /**
-     * Builds "The Hero's Tunneler" Trophy Pickaxe (Unbreakable, 3x3 mining, PDC-persistent).
-     */
     fun createHerosTunneler(): ItemStack {
         return ItemStack(Material.NETHERITE_PICKAXE, 1).apply {
             editMeta { meta ->
@@ -150,11 +154,17 @@ class HerobrineManager(private val plugin: TravellersTales) {
         }
     }
 
-    fun getFight(entity: Entity): ActiveHerobrineFight? = activeFights[entity.uniqueId]
+    fun getFight(entity: Entity): ActiveHerobrineFight? {
+        val fight = activeFights[entity.uniqueId]
+        if (fight != null && entity is Mannequin && entity.isValid && fight.mannequin !== entity) {
+            fight.rebindMannequin(entity)
+        }
+        return fight
+    }
 
     fun getFightBySteve(steveEntity: Entity): ActiveHerobrineFight? {
         return activeFights.values.firstOrNull { fight ->
-            fight.activeSteves.any { it.mannequin.uniqueId == steveEntity.uniqueId }
+            fight.activeSteves.any { it.steveId == steveEntity.uniqueId }
         }
     }
 

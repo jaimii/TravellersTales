@@ -1,6 +1,8 @@
 package project.kompass.travellersTales.boss.herobrine
 
 import org.bukkit.*
+import org.bukkit.attribute.Attribute
+import org.bukkit.attribute.AttributeModifier
 import org.bukkit.damage.DamageSource
 import org.bukkit.damage.DamageType
 import org.bukkit.entity.*
@@ -9,15 +11,19 @@ import org.bukkit.event.EventPriority
 import org.bukkit.event.Listener
 import org.bukkit.event.block.BlockBreakEvent
 import org.bukkit.event.block.BlockIgniteEvent
+import org.bukkit.event.entity.CreatureSpawnEvent
 import org.bukkit.event.entity.EntityDamageByEntityEvent
 import org.bukkit.event.entity.EntityDamageEvent
 import org.bukkit.event.entity.EntityDeathEvent
+import org.bukkit.event.entity.EntityExplodeEvent
 import org.bukkit.event.entity.PlayerDeathEvent
 import org.bukkit.event.entity.ProjectileHitEvent
 import org.bukkit.event.player.PlayerJoinEvent
+import org.bukkit.event.world.EntitiesLoadEvent
 import org.bukkit.persistence.PersistentDataType
 import org.bukkit.potion.PotionEffect
 import org.bukkit.potion.PotionEffectType
+import org.bukkit.util.Vector
 import project.kompass.travellersTales.TravellersTales
 import project.kompass.travellersTales.registry.MobKeys
 import project.kompass.travellersTales.util.BossKillTracker
@@ -45,6 +51,22 @@ class HerobrineListener(
     }
 
     private val activeTunnelingPlayers = HashSet<UUID>()
+    private val stunJumpLockKey = NamespacedKey(plugin, "herobrine_stun_jump_lock")
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    fun onEntitiesLoad(event: EntitiesLoadEvent) {
+        for (entity in event.entities) {
+            if (entity is Mannequin) {
+                if (manager.isHerobrineEntity(entity)) {
+                    manager.rebindHerobrineIfTracked(entity)
+                } else if (entity.persistentDataContainer.has(MobKeys.HEROBRINE_MINION, PersistentDataType.BYTE)) {
+                    manager.getFightBySteve(entity)?.activeSteves
+                        ?.firstOrNull { it.steveId == entity.uniqueId }
+                        ?.mannequin = entity
+                }
+            }
+        }
+    }
 
     // ========================================================================
     // 1. HEROBRINE SHRINE IGNITION
@@ -116,32 +138,98 @@ class HerobrineListener(
     }
 
     // ========================================================================
-    // 3. PROJECTILES: CHANNELING TRIDENT SLAM, TRIDENT PARRY & ARROW REFLECTION
+    // 3. PROJECTILES: TRIDENT STUN, SHIELD-BLOCKABLE WITHER SKULLS & REFLECTIONS
     // ========================================================================
+
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    fun onHerobrineSkullBlockExplode(event: EntityExplodeEvent) {
+        val skull = event.entity as? WitherSkull ?: return
+        if (skull.persistentDataContainer.has(MobKeys.HEROBRINE_MINION, PersistentDataType.BYTE)) {
+            event.blockList().clear()
+        }
+    }
+
+    /**
+     * Allows players to block Herobrine's Wither Skulls with a raised shield!
+     */
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    fun onPlayerDamagedByHerobrineSkull(event: EntityDamageByEntityEvent) {
+        val player = event.entity as? Player ?: return
+        val skull = event.damager as? WitherSkull ?: return
+        if (!skull.persistentDataContainer.has(MobKeys.HEROBRINE_MINION, PersistentDataType.BYTE)) return
+
+        if (player.isBlocking && isFrontalHit(player, skull)) {
+            event.isCancelled = true
+            player.world.playSound(player.location, Sound.ITEM_SHIELD_BLOCK, SoundCategory.PLAYERS, 1.5f, 1.0f)
+            player.world.spawnParticle(Particle.CRIT, player.eyeLocation, 10, 0.25, 0.25, 0.25, 0.1)
+            val push = player.location.toVector().subtract(skull.location.toVector()).setY(0.0)
+            if (push.lengthSquared() > 1e-4) push.normalize()
+            player.velocity = player.velocity.add(push.multiply(0.35).setY(0.15))
+            skull.remove()
+        }
+    }
 
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
     fun onProjectileHit(event: ProjectileHitEvent) {
         val projectile = event.entity
 
-        // A. Herobrine's Thrown Channeling Trident Hits Ground or Entity -> Stun + Instant Slam!
+        // A. Herobrine's Thrown Channeling Trident Hits Ground or Player -> Lightning Strike + Stun!
         if (projectile is Trident && projectile.persistentDataContainer.has(MobKeys.HEROBRINE_TRIDENT, PersistentDataType.BYTE)) {
             val shooter = projectile.shooter as? Mannequin ?: return
             val fight = manager.getFight(shooter) ?: return
 
+            val impactLoc = event.hitEntity?.location ?: projectile.location
+            impactLoc.world?.strikeLightningEffect(impactLoc)
+            impactLoc.world?.playSound(impactLoc, Sound.ITEM_TRIDENT_THUNDER, SoundCategory.HOSTILE, 3.0f, 1.0f)
+
             val hitPlayer = event.hitEntity as? Player
             if (hitPlayer != null && !hitPlayer.isDead) {
                 handleHerobrineTridentHitPlayer(fight, projectile, hitPlayer)
+            } else {
+                impactLoc.getNearbyPlayers(2.0)
+                    .filter { !it.isDead && (it.gameMode == GameMode.SURVIVAL || it.gameMode == GameMode.ADVENTURE) }
+                    .forEach { handleHerobrineTridentHitPlayer(fight, projectile, it) }
             }
 
-            val impactLoc = event.hitEntity?.location ?: projectile.location
             projectile.remove()
-            fight.executePhase2InstantLightningSlam(impactLoc)
+            return
+        }
+
+        // B. Herobrine's Homing Wither Skulls -> Shield-Blockable, or Lightning Animation on Hit!
+        if (projectile is WitherSkull && projectile.persistentDataContainer.has(MobKeys.HEROBRINE_MINION, PersistentDataType.BYTE)) {
+            val hitEnt = event.hitEntity
+            if (hitEnt is Mannequin && (manager.getFight(hitEnt) != null || hitEnt.persistentDataContainer.has(MobKeys.HEROBRINE_MINION, PersistentDataType.BYTE))) {
+                event.isCancelled = true
+                return
+            }
+
+            val impactLoc = hitEnt?.location ?: projectile.location
+            val hitPlayer = (hitEnt as? Player)
+                ?: impactLoc.getNearbyPlayers(2.4).firstOrNull { !it.isDead && (it.gameMode == GameMode.SURVIVAL || it.gameMode == GameMode.ADVENTURE) }
+
+            if (hitPlayer != null) {
+                // If player is blocking with a shield facing the skull, deflect it without lightning or damage!
+                if (hitPlayer.isBlocking && isFrontalHit(hitPlayer, projectile)) {
+                    event.isCancelled = true
+                    hitPlayer.world.playSound(hitPlayer.location, Sound.ITEM_SHIELD_BLOCK, SoundCategory.PLAYERS, 1.5f, 1.0f)
+                    hitPlayer.world.spawnParticle(Particle.CRIT, projectile.location, 12, 0.25, 0.25, 0.25, 0.1)
+                    val push = hitPlayer.location.toVector().subtract(projectile.location.toVector()).setY(0.0)
+                    if (push.lengthSquared() > 1e-4) push.normalize()
+                    hitPlayer.velocity = hitPlayer.velocity.add(push.multiply(0.35).setY(0.15))
+                    projectile.remove()
+                    return
+                }
+
+                // Unblocked hit: strike lightning animation!
+                impactLoc.world?.strikeLightningEffect(hitPlayer.location)
+                impactLoc.world?.playSound(hitPlayer.location, Sound.ENTITY_LIGHTNING_BOLT_THUNDER, SoundCategory.HOSTILE, 2.0f, 1.1f)
+            }
             return
         }
 
         val hitEntity = event.hitEntity as? Mannequin ?: return
 
-        // B. Friendly fire filter between Herobrine and his Steves
+        // C. Friendly fire filter between Herobrine and his Steves
         val shooter = projectile.shooter
         if (shooter is Mannequin) {
             val shooterIsAllied = manager.getFight(shooter) != null ||
@@ -156,18 +244,33 @@ class HerobrineListener(
         }
 
         val fight = manager.getFight(hitEntity) ?: return
-        val arrowOrTrident = projectile as? AbstractArrow ?: return
-        if (arrowOrTrident.shooter == fight.mannequin) return
+        if (projectile.shooter == fight.mannequin) return
 
-        // C. Herobrine ALWAYS parries Trident projectiles back at the shooter!
+        // D. Herobrine ALWAYS reflects Wind Charges & Fireballs back at the shooter!
+        if (projectile is Fireball || projectile is AbstractWindCharge) {
+            event.isCancelled = true
+            fight.mannequin.swingMainHand()
+            reflectProjectileBackToShooter(fight.mannequin, projectile)
+            if (fight.currentPhase == 0) {
+                fight.awakenPhase1(projectile.shooter as? Player)
+            }
+            return
+        }
+
+        val arrowOrTrident = projectile as? AbstractArrow ?: return
+
+        // E. Herobrine ALWAYS parries Trident projectiles back at the shooter!
         if (arrowOrTrident is Trident) {
             event.isCancelled = true
             fight.mannequin.swingMainHand()
             reflectProjectileBackToShooter(fight.mannequin, arrowOrTrident)
+            if (fight.currentPhase == 0) {
+                fight.awakenPhase1(arrowOrTrident.shooter as? Player)
+            }
             return
         }
 
-        // D. Reflect arrows while floating invulnerable
+        // F. Reflect all Arrow types (Normal, Tipped, Spectral) while floating invulnerable
         if (fight.isFloatingInvulnerable) {
             event.isCancelled = true
             reflectProjectileBackToShooter(fight.mannequin, arrowOrTrident)
@@ -187,60 +290,109 @@ class HerobrineListener(
             player.damage(4.0, armorIgnoreSource)
         }
 
-        // Stun player for 1 second (20 ticks) regardless of shield
         player.clearActiveItem()
         player.setCooldown(Material.SHIELD, 20)
         player.addPotionEffect(PotionEffect(PotionEffectType.SLOWNESS, 20, 254, false, true, true))
-        player.addPotionEffect(PotionEffect(PotionEffectType.JUMP_BOOST, 20, 250, false, true, true))
+        applyStunJumpLock(player, 20)
         player.sendActionBar("<bold><red>⚡ STUNNED BY HEROBRINE'S TRIDENT! ⚡</red></bold>".mm())
     }
 
-    private fun reflectProjectileBackToShooter(herobrine: Mannequin, projectile: AbstractArrow) {
-        val incomingVel = projectile.velocity
-        val speed = incomingVel.length().coerceAtLeast(1.4)
-        val shooter = projectile.shooter as? LivingEntity
-
-        val reflectDir = if (shooter != null && shooter.isValid && shooter.world == herobrine.world) {
-            shooter.location.clone().add(0.0, shooter.height * 0.65, 0.0)
-                .toVector()
-                .subtract(projectile.location.toVector())
-                .normalize()
-        } else if (incomingVel.lengthSquared() > 1e-4) {
-            incomingVel.clone().multiply(-1.0).normalize()
-        } else {
-            herobrine.location.direction.normalize()
-        }
-
-        val newVelocity = reflectDir.clone().multiply(speed)
-        val spawnLoc = projectile.location.clone().add(reflectDir.clone().multiply(0.8))
-        spawnLoc.direction = newVelocity
-
-        val world = herobrine.world
-        world.spawn(spawnLoc, projectile.javaClass) { reflected ->
-            reflected.shooter = herobrine
-            reflected.velocity = newVelocity
-            reflected.damage = projectile.damage
-            reflected.isCritical = projectile.isCritical
-            reflected.pierceLevel = projectile.pierceLevel
-            reflected.fireTicks = projectile.fireTicks
-            reflected.pickupStatus = AbstractArrow.PickupStatus.DISALLOWED
-        }
-
-        world.playSound(projectile.location, Sound.ITEM_TRIDENT_HIT, SoundCategory.HOSTILE, 1.5f, 1.4f)
-        world.playSound(projectile.location, Sound.BLOCK_ANVIL_LAND, SoundCategory.HOSTILE, 0.9f, 1.8f)
-        world.spawnParticle(Particle.CRIT, projectile.location, 15, 0.2, 0.2, 0.2, 0.1)
-        world.spawnParticle(
-            Particle.DUST,
-            projectile.location,
-            10, 0.2, 0.2, 0.2, 0.0,
-            Particle.DustOptions(Color.fromRGB(255, 15, 15), 1.5f)
+    private fun applyStunJumpLock(player: Player, durationTicks: Int) {
+        val jumpAttr = player.getAttribute(Attribute.JUMP_STRENGTH) ?: return
+        jumpAttr.getModifier(stunJumpLockKey)?.let { jumpAttr.removeModifier(it) }
+        jumpAttr.addModifier(
+            AttributeModifier(stunJumpLockKey, -1.0, AttributeModifier.Operation.MULTIPLY_SCALAR_1)
         )
+        player.velocity = Vector(0.0, player.velocity.y.coerceAtMost(0.0), 0.0)
 
-        projectile.remove()
+        Bukkit.getScheduler().runTaskLater(plugin, Runnable {
+            player.getAttribute(Attribute.JUMP_STRENGTH)?.getModifier(stunJumpLockKey)?.let { mod ->
+                player.getAttribute(Attribute.JUMP_STRENGTH)?.removeModifier(mod)
+            }
+        }, durationTicks.toLong())
+    }
+
+    private fun reflectProjectileBackToShooter(herobrine: Mannequin, projectile: Projectile) {
+        try {
+            val incomingVel = projectile.velocity
+            val speed = incomingVel.length().coerceAtLeast(1.4)
+            val shooter = projectile.shooter as? LivingEntity
+
+            val reflectDir = if (shooter != null && shooter.isValid && shooter.world == herobrine.world) {
+                shooter.location.clone().add(0.0, shooter.height * 0.65, 0.0)
+                    .toVector()
+                    .subtract(projectile.location.toVector())
+                    .normalize()
+            } else if (incomingVel.lengthSquared() > 1e-4) {
+                incomingVel.clone().multiply(-1.0).normalize()
+            } else {
+                herobrine.location.direction.normalize()
+            }
+
+            val newVelocity = reflectDir.clone().multiply(speed)
+            val spawnLoc = projectile.location.clone().add(reflectDir.clone().multiply(1.0))
+            spawnLoc.direction = newVelocity
+
+            val world = herobrine.world
+            val spawned = world.spawnEntity(spawnLoc, projectile.type, CreatureSpawnEvent.SpawnReason.CUSTOM)
+
+            if (spawned is Projectile) {
+                spawned.shooter = herobrine
+                spawned.velocity = newVelocity
+            }
+
+            when {
+                spawned is AbstractArrow && projectile is AbstractArrow -> {
+                    spawned.damage = projectile.damage
+                    spawned.isCritical = projectile.isCritical
+                    spawned.pierceLevel = projectile.pierceLevel
+                    spawned.fireTicks = projectile.fireTicks
+                    spawned.pickupStatus = AbstractArrow.PickupStatus.DISALLOWED
+
+                    if (spawned is Arrow && projectile is Arrow) {
+                        projectile.basePotionType?.let { spawned.basePotionType = it }
+                        projectile.customEffects.forEach { effect ->
+                            spawned.addCustomEffect(effect, true)
+                        }
+                        projectile.color?.let { spawned.color = it }
+                    } else if (spawned is SpectralArrow && projectile is SpectralArrow) {
+                        spawned.glowingTicks = projectile.glowingTicks
+                    } else if (spawned is Trident && projectile is Trident) {
+                        spawned.itemStack = projectile.itemStack.clone()
+                    }
+                }
+
+                spawned is Fireball && projectile is Fireball -> {
+                    spawned.direction = reflectDir
+                    spawned.velocity = newVelocity
+                    spawned.yield = projectile.yield
+                    spawned.setIsIncendiary(projectile.isIncendiary)
+                }
+            }
+
+            val deflectSound = when (projectile) {
+                is AbstractWindCharge -> Sound.ENTITY_BREEZE_DEFLECT
+                is Fireball -> Sound.ITEM_FIRECHARGE_USE
+                is Trident -> Sound.ITEM_TRIDENT_HIT
+                else -> Sound.BLOCK_ANVIL_LAND
+            }
+            world.playSound(projectile.location, deflectSound, SoundCategory.HOSTILE, 1.6f, 1.3f)
+            world.spawnParticle(Particle.CRIT, projectile.location, 15, 0.2, 0.2, 0.2, 0.1)
+            world.spawnParticle(
+                Particle.DUST,
+                projectile.location,
+                10, 0.2, 0.2, 0.2, 0.0,
+                Particle.DustOptions(Color.fromRGB(255, 15, 15), 1.5f)
+            )
+        } finally {
+            if (projectile.isValid) {
+                projectile.remove()
+            }
+        }
     }
 
     // ========================================================================
-    // 4. STEVE 35% MELEE SHIELD BLOCK & STUN + HEROBRINE COMBAT & DEATH TRIGGER
+    // 4. STEVE 35% MELEE SHIELD BLOCK & STUN + HEROBRINE COMBAT & MELEE BLINK
     // ========================================================================
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
@@ -250,8 +402,19 @@ class HerobrineListener(
         // Case A: Steve Minion Shield Block (35% melee block) & Axe/Shield Stun
         if (victim.persistentDataContainer.has(MobKeys.HEROBRINE_MINION, PersistentDataType.BYTE)) {
             val fight = manager.getFightBySteve(victim) ?: return
-            val steveController = fight.activeSteves.firstOrNull { it.mannequin.uniqueId == victim.uniqueId } ?: return
-            val attacker = event.damager as? LivingEntity ?: return
+
+            val rawDamager = event.damager
+            if (rawDamager == fight.mannequin ||
+                rawDamager.persistentDataContainer.has(MobKeys.HEROBRINE_MINION, PersistentDataType.BYTE) ||
+                (rawDamager is Projectile && (rawDamager.shooter == fight.mannequin ||
+                        (rawDamager.shooter as? Entity)?.persistentDataContainer?.has(MobKeys.HEROBRINE_MINION, PersistentDataType.BYTE) == true))
+            ) {
+                event.isCancelled = true
+                return
+            }
+
+            val steveController = fight.activeSteves.firstOrNull { it.steveId == victim.uniqueId } ?: return
+            val attacker = rawDamager as? LivingEntity ?: return
 
             if (!steveController.isStunned() && isFrontalHit(victim, attacker)) {
                 val mainItem = attacker.equipment?.itemInMainHand?.type ?: Material.AIR
@@ -280,25 +443,41 @@ class HerobrineListener(
             return
         }
 
-        // Case B: Safety fallback for Tridents hitting Herobrine
+        // Case B: Safety fallback for Tridents, Wind Charges, and Fireballs hitting Herobrine
         val fight = manager.getFight(victim) ?: return
         val damager = event.damager
-        if (damager is Trident && damager.shooter != fight.mannequin) {
-            event.isCancelled = true
-            fight.mannequin.swingMainHand()
-            reflectProjectileBackToShooter(fight.mannequin, damager)
+        if (damager is Projectile && damager.shooter != fight.mannequin) {
+            if (damager is Trident || damager is Fireball || damager is AbstractWindCharge) {
+                event.isCancelled = true
+                fight.mannequin.swingMainHand()
+                reflectProjectileBackToShooter(fight.mannequin, damager)
+            }
         }
     }
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     fun onHerobrineDamaged(event: EntityDamageEvent) {
         val mannequin = event.entity as? Mannequin ?: return
+
+        if (mannequin.persistentDataContainer.has(MobKeys.HEROBRINE_MINION, PersistentDataType.BYTE)) {
+            if (event.cause == EntityDamageEvent.DamageCause.FALL ||
+                event.cause == EntityDamageEvent.DamageCause.LIGHTNING ||
+                event.cause == EntityDamageEvent.DamageCause.BLOCK_EXPLOSION ||
+                event.cause == EntityDamageEvent.DamageCause.ENTITY_EXPLOSION ||
+                event.cause == EntityDamageEvent.DamageCause.WITHER
+            ) {
+                event.isCancelled = true
+            }
+            return
+        }
+
         val fight = manager.getFight(mannequin) ?: return
 
         if (event.cause == EntityDamageEvent.DamageCause.FALL ||
             event.cause == EntityDamageEvent.DamageCause.LIGHTNING ||
             event.cause == EntityDamageEvent.DamageCause.BLOCK_EXPLOSION ||
-            event.cause == EntityDamageEvent.DamageCause.ENTITY_EXPLOSION
+            event.cause == EntityDamageEvent.DamageCause.ENTITY_EXPLOSION ||
+            event.cause == EntityDamageEvent.DamageCause.WITHER
         ) {
             event.isCancelled = true
             return
@@ -312,15 +491,17 @@ class HerobrineListener(
         if (fight.isFloatingInvulnerable) {
             event.isCancelled = true
             val damager = (event as? EntityDamageByEntityEvent)?.damager
-            if (damager is AbstractArrow && damager.shooter != fight.mannequin) {
+            if (damager is Projectile && damager.shooter != fight.mannequin) {
                 reflectProjectileBackToShooter(fight.mannequin, damager)
             }
             return
         }
 
-        val attacker: Player? = when (val damager = (event as? EntityDamageByEntityEvent)?.damager) {
-            is Player -> damager
-            is Projectile -> damager.shooter as? Player
+        val rawDamager = (event as? EntityDamageByEntityEvent)?.damager
+        val wasDirectMeleeHit = rawDamager is Player
+        val attacker: Player? = when (rawDamager) {
+            is Player -> rawDamager
+            is Projectile -> rawDamager.shooter as? Player
             else -> null
         }
 
@@ -330,7 +511,6 @@ class HerobrineListener(
             return
         }
 
-        // Intercept lethal damage to play Herobrine's ascension death animation
         if (mannequin.health - event.finalDamage <= 0.0) {
             event.damage = 0.0
             fight.triggerDeathAnimation(attacker)
@@ -339,8 +519,11 @@ class HerobrineListener(
 
         val finalDmg = event.finalDamage
         Bukkit.getScheduler().runTask(plugin, Runnable {
-            if (!fight.isDeadOrRemoved && !fight.isDyingAnimation && mannequin.isValid && !mannequin.isDead) {
+            if (!fight.isDeadOrRemoved && !fight.isDyingAnimation && fight.mannequin.isValid && !fight.mannequin.isDead) {
                 fight.onDamaged(finalDmg, attacker)
+                if (wasDirectMeleeHit && attacker != null) {
+                    fight.tryCombatMeleeBlink(attacker)
+                }
             }
         })
     }
@@ -426,7 +609,7 @@ class HerobrineListener(
 
         if (killerFight != null) {
             event.deathMessage("<white>Herobrine has slain ${player.name}</white>".mm())
-            DiscordSrvHook.sendPlayerSlainByHerobrine(player.name)
+            DiscordSrvHook.sendPlayerSlainByHerobrine(player.name, player.uniqueId)
         }
     }
 
@@ -434,7 +617,6 @@ class HerobrineListener(
     fun onMannequinDeath(event: EntityDeathEvent) {
         val entity = event.entity as? Mannequin ?: return
 
-        // Steve Minion Death: drop 10 levels of EXP (manager.config.steveMinionExpLevelsDropped)
         if (entity.persistentDataContainer.has(MobKeys.HEROBRINE_MINION, PersistentDataType.BYTE)) {
             event.drops.clear()
             event.droppedExp = 0
@@ -446,7 +628,6 @@ class HerobrineListener(
             return
         }
 
-        // Herobrine Boss Death fallback
         val fight = manager.activeFights.remove(entity.uniqueId) ?: return
         event.drops.clear()
         event.droppedExp = 0

@@ -9,6 +9,7 @@ import org.bukkit.entity.Wither
 import org.bukkit.event.entity.CreatureSpawnEvent
 import project.kompass.travellersTales.TravellersTales
 import project.kompass.travellersTales.boss.cube.CubeBossType
+import project.kompass.travellersTales.util.BossKillTracker
 import project.kompass.travellersTales.util.mm
 
 object TravellersTalesCommand {
@@ -32,7 +33,7 @@ object TravellersTalesCommand {
                             .executes { ctx ->
                                 val player = requirePlayer(ctx.source) ?: return@executes Command.SINGLE_SUCCESS
                                 plugin.wardenManager.summonWardenWithIntro(player.location, player)
-                                player.sendMessage("<bold><#00A8FF>[The Warden]</#00A8FF></bold> <gray>Emerging from the deep dark!</gray>".mm())
+                                player.sendMessage("<bold><#0047AB>[The Warden]</#0047AB></bold> <gray>Emerging from the deep dark!</gray>".mm())
                                 Command.SINGLE_SUCCESS
                             }
                     )
@@ -50,7 +51,7 @@ object TravellersTalesCommand {
                             .executes { ctx ->
                                 val player = requirePlayer(ctx.source) ?: return@executes Command.SINGLE_SUCCESS
                                 plugin.giantManager.spawnGiant(player.location, player.uniqueId)
-                                player.sendMessage("<bold><green>[Giant]</green></bold> <gray>Crawling out of the earth!</gray>".mm())
+                                player.sendMessage("<bold><green>[ɢɪᴀɴᴛ]</green></bold> <gray>Crawling out of the earth!</gray>".mm())
                                 Command.SINGLE_SUCCESS
                             }
                     )
@@ -59,7 +60,7 @@ object TravellersTalesCommand {
                             .executes { ctx ->
                                 val player = requirePlayer(ctx.source) ?: return@executes Command.SINGLE_SUCCESS
                                 plugin.dreadnoughtManager.spawnDreadnought(player.location, playSpawnAnimation = true)
-                                player.sendMessage("<bold><gold>[Dreadnought Golem]</gold></bold> <gray>Beacon core powering online!</gray>".mm())
+                                player.sendMessage("<bold><gold>[ᴅʀᴇᴀᴅɴᴏᴜɢʜᴛ</gold> <green>ɢᴏʟᴇᴍ]</green></bold> <gray>Beacon core powering online!</gray>".mm())
                                 Command.SINGLE_SUCCESS
                             }
                     )
@@ -78,6 +79,19 @@ object TravellersTalesCommand {
                                 val player = requirePlayer(ctx.source) ?: return@executes Command.SINGLE_SUCCESS
                                 plugin.cubeBossManager.summonCubeBossWithIntro(player.location, CubeBossType.MAGMA_CORE)
                                 player.sendMessage("<bold><red>[Magma Core]</red></bold> <gray>Awakening The Magma Core!</gray>".mm())
+                                Command.SINGLE_SUCCESS
+                            }
+                    )
+                    .then(
+                        Commands.literal("herobrine")
+                            .executes { ctx ->
+                                val player = requirePlayer(ctx.source) ?: return@executes Command.SINGLE_SUCCESS
+                                val fight = plugin.herobrineManager.summonHerobrine(player.location, player.uniqueId)
+                                if (fight != null) {
+                                    player.sendMessage("<bold><white>[Herobrine]</white></bold> <gray>Summoned Herobrine!</gray>".mm())
+                                } else {
+                                    player.sendMessage("<red>Herobrine is already active on the server!</red>".mm())
+                                }
                                 Command.SINGLE_SUCCESS
                             }
                     )
@@ -104,6 +118,24 @@ object TravellersTalesCommand {
                     )
             )
             .then(
+                Commands.literal("tunneler")
+                    .executes { ctx ->
+                        val player = requirePlayer(ctx.source) ?: return@executes Command.SINGLE_SUCCESS
+                        player.inventory.addItem(plugin.herobrineManager.createHerosTunneler())
+                        player.sendMessage("<light_purple>Given The Hero's Tunneler!</light_purple>".mm())
+                        Command.SINGLE_SUCCESS
+                    }
+            )
+            .then(
+                Commands.literal("unlock_shrine")
+                    .executes { ctx ->
+                        val player = requirePlayer(ctx.source) ?: return@executes Command.SINGLE_SUCCESS
+                        BossKillTracker.unlockAllForPlayer(player)
+                        player.sendMessage("<green>Unlocked all 7 prerequisite bosses for the Herobrine Shrine!</green>".mm())
+                        Command.SINGLE_SUCCESS
+                    }
+            )
+            .then(
                 Commands.literal("reload")
                     .executes { ctx ->
                         plugin.reloadConfig()
@@ -115,6 +147,7 @@ object TravellersTalesCommand {
                         plugin.giantManager.reloadConfig()
                         plugin.dreadnoughtManager.reloadConfig()
                         plugin.cubeBossManager.reloadConfig()
+                        plugin.herobrineManager.reloadConfig()
 
                         ctx.source.sender.sendMessage(
                             "<bold><gold>[TravellersTales]</gold></bold> <green>All boss configurations and weapon resistances reloaded from config.yml!</green>".mm()
@@ -132,6 +165,7 @@ object TravellersTalesCommand {
                         plugin.giantManager.runFixRoutine()
                         plugin.dreadnoughtManager.runFixRoutine()
                         plugin.cubeBossManager.runFixRoutine()
+                        plugin.herobrineManager.runFixRoutine()
                         plugin.bossBarManager.clearAllBars()
 
                         ctx.source.sender.sendMessage(
@@ -150,6 +184,7 @@ object TravellersTalesCommand {
                         val giants = plugin.giantManager.activeFights.size
                         val dreadnoughts = plugin.dreadnoughtManager.activeFights.size
                         val cubeBosses = plugin.cubeBossManager.activeFights.size
+                        val herobrineAlive = plugin.herobrineManager.isHerobrineActiveAnywhere()
                         val weaponResOnlyBosses = plugin.weaponResistanceListener.onlyCustomBosses
                         val weaponResMult = plugin.weaponResistanceListener.damageMultiplier
 
@@ -163,6 +198,7 @@ object TravellersTalesCommand {
                             <gray>Active Giants:</gray> <green>$giants</green>
                             <gray>Active Dreadnoughts:</gray> <gold>$dreadnoughts</gold>
                             <gray>Active Cube Bosses:</gray> <light_purple>$cubeBosses</light_purple>
+                            <gray>Herobrine:</gray> ${if (herobrineAlive) "<red>Active</red>" else "<green>None</green>"}
                             <gray>Weapon Resistance:</gray> <white>${(1.0 - weaponResMult) * 100}% reduction</white> <gray>(Only Bosses: <white>$weaponResOnlyBosses</white>)</gray>
                             """.trimIndent().mm()
                         )

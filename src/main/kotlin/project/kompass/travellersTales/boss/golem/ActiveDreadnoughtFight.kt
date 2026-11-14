@@ -14,15 +14,19 @@ import org.bukkit.util.Vector
 import project.kompass.travellersTales.TravellersTales
 import project.kompass.travellersTales.registry.MobKeys
 import project.kompass.travellersTales.util.mm
+import java.util.UUID
 import kotlin.math.cos
 import kotlin.math.sin
 
 class ActiveDreadnoughtFight(
     private val plugin: TravellersTales,
-    val golem: IronGolem,
+    var golem: IronGolem,
     var config: DreadnoughtConfig
 ) {
-    val world: World = golem.world
+    val golemId: UUID = golem.uniqueId
+    val world: World
+        get() = golem.world
+
     private val tasks = mutableListOf<BukkitTask>()
     private var patrolAnchor: Location = golem.location.clone()
 
@@ -38,29 +42,60 @@ class ActiveDreadnoughtFight(
     private var targetScanCooldownTicks: Int = 0
 
     // Beacon Energy Particle Palette
+    private val beaconCyanColor = Color.fromRGB(0, 245, 255)
     private val beaconCyanGold = Particle.DustTransition(
-        Color.fromRGB(0, 245, 255),   // Beacon Cyan
+        beaconCyanColor,              // Beacon Cyan
         Color.fromRGB(255, 215, 0),   // Dreadnought Gold
         1.7f
     )
     private val beaconOverloadRed = Particle.DustTransition(
-        Color.fromRGB(0, 245, 255),
+        beaconCyanColor,
         Color.fromRGB(255, 50, 50),
         2.0f
     )
 
-    fun start(playSpawnAnimation: Boolean = true) {
-        configureGolemEntity()
+    fun start(playSpawnAnimation: Boolean = true, preserveCurrentHealth: Boolean = false) {
+        configureGolemEntity(preserveCurrentHealth)
         plugin.bossBarManager.createBossBar(golem, config.bossBar)
+        scheduleCoreLoops()
         if (playSpawnAnimation) {
             playBeaconSpawnAnimation()
         } else {
-            world.playSound(golem.location, Sound.BLOCK_BEACON_ACTIVATE, SoundCategory.NEUTRAL, 1.5f, 1.0f)
+            world.playSound(golem.location, Sound.BLOCK_BEACON_ACTIVATE, SoundCategory.NEUTRAL, 2.5f, 1.0f)
         }
-        scheduleCoreLoops()
     }
 
-    private fun configureGolemEntity() {
+    /**
+     * Updates the live IronGolem entity reference after a chunk unload/reload.
+     */
+    fun rebindGolem(loadedGolem: IronGolem) {
+        this.golem = loadedGolem
+        if (!isDying) {
+            isPerformingSmash = false
+            configureGolemEntity(preserveCurrentHealth = true)
+            plugin.bossBarManager.createBossBar(loadedGolem, config.bossBar)
+        }
+    }
+
+    private fun ensureLiveGolem(): Boolean {
+        if (golem.isValid) return true
+        val live = Bukkit.getEntity(golemId) as? IronGolem
+        if (live != null && live.isValid) {
+            rebindGolem(live)
+            return true
+        }
+        return false
+    }
+
+    private fun configureGolemEntity(preserveCurrentHealth: Boolean) {
+        val savedHealth = if (preserveCurrentHealth) {
+            golem.persistentDataContainer.get(MobKeys.BOSS_CUSTOM_HEALTH, PersistentDataType.DOUBLE)
+                ?: golem.health.takeIf { it > 0.0 }
+                ?: config.maxHealth
+        } else {
+            config.maxHealth
+        }
+
         golem.persistentDataContainer.set(MobKeys.MOB_ID, PersistentDataType.STRING, "dreadnought_golem")
         golem.customName(config.displayName.mm())
         golem.isCustomNameVisible = true
@@ -69,7 +104,9 @@ class ActiveDreadnoughtFight(
         golem.removeWhenFarAway = false
 
         golem.getAttribute(Attribute.MAX_HEALTH)?.baseValue = config.maxHealth
-        golem.health = config.maxHealth
+        golem.health = savedHealth.coerceIn(1.0, config.maxHealth)
+        golem.persistentDataContainer.set(MobKeys.BOSS_CUSTOM_HEALTH, PersistentDataType.DOUBLE, golem.health)
+
         golem.getAttribute(Attribute.ATTACK_DAMAGE)?.baseValue = config.attackDamage
         golem.getAttribute(Attribute.ARMOR)?.baseValue = config.armor
         golem.getAttribute(Attribute.MOVEMENT_SPEED)?.baseValue = config.movementSpeed
@@ -79,9 +116,11 @@ class ActiveDreadnoughtFight(
         golem.getAttribute(Attribute.SAFE_FALL_DISTANCE)?.baseValue = 100.0
 
         // Permanent self-regeneration (ambient = true, particles = false)
-        golem.addPotionEffect(
-            PotionEffect(PotionEffectType.REGENERATION, PotionEffect.INFINITE_DURATION, 0, true, false, false)
-        )
+        if (!isDying) {
+            golem.addPotionEffect(
+                PotionEffect(PotionEffectType.REGENERATION, PotionEffect.INFINITE_DURATION, 0, true, false, false)
+            )
+        }
     }
 
     // ========================================================================
@@ -92,9 +131,9 @@ class ActiveDreadnoughtFight(
         val origin = golem.location.clone()
         val coreLoc = origin.clone().add(0.0, 1.4, 0.0)
 
-        world.playSound(origin, Sound.BLOCK_BEACON_ACTIVATE, SoundCategory.NEUTRAL, 2.5f, 1.0f)
-        world.playSound(origin, Sound.BLOCK_BEACON_POWER_SELECT, SoundCategory.NEUTRAL, 2.5f, 1.2f)
-        world.spawnParticle(Particle.FLASH, coreLoc, 2)
+        world.playSound(origin, Sound.BLOCK_BEACON_ACTIVATE, SoundCategory.NEUTRAL, 3.0f, 1.0f)
+        world.playSound(origin, Sound.BLOCK_BEACON_POWER_SELECT, SoundCategory.NEUTRAL, 3.0f, 1.2f)
+        world.spawnParticle(Particle.FLASH, coreLoc, 2, 0.0, 0.0, 0.0, 0.0, beaconCyanColor)
 
         // Vertical Beacon Sky-Beam shooting 24 blocks upward
         for (y in 0..24) {
@@ -108,7 +147,7 @@ class ActiveDreadnoughtFight(
         var introTask: BukkitTask? = null
         introTask = runTimer(1L, 1L) {
             tick++
-            if (!golem.isValid || isDying || tick > 30) {
+            if (!ensureLiveGolem() || isDying || tick > 30) {
                 introTask?.cancel()
                 return@runTimer
             }
@@ -132,9 +171,10 @@ class ActiveDreadnoughtFight(
     // ========================================================================
 
     private fun scheduleCoreLoops() {
-        // 1-Tick Loop: Rapid Attack Cadence with Cached Target System (Optimized)
+        // 1-Tick Loop: Rapid Attack Cadence with Cached Target System
         runTimer(1L, 1L) {
-            if (!golem.isValid || golem.isDead || isDying || isPerformingSmash) return@runTimer
+            if (isDying || isPerformingSmash) return@runTimer
+            if (!ensureLiveGolem() || golem.isDead) return@runTimer
 
             // Always disallow targeting players
             if (golem.target is Player) {
@@ -146,12 +186,13 @@ class ActiveDreadnoughtFight(
             // Validate existing cached target
             val target = cachedTarget
             if (target == null || !target.isValid || target.isDead || !isHostileEnemy(target) ||
+                target.world != world ||
                 target.location.distanceSquared(golem.location) > config.followRange * config.followRange
             ) {
                 cachedTarget = null
             }
 
-            // Only perform expensive nearby entity lookup every 15 ticks when a new target is needed
+            // Perform nearby entity lookup every 15 ticks when a new target is needed
             if (cachedTarget == null) {
                 if (targetScanCooldownTicks > 0) {
                     targetScanCooldownTicks--
@@ -167,18 +208,23 @@ class ActiveDreadnoughtFight(
             // Execute rapid melee cadence against cached target
             val current = cachedTarget ?: return@runTimer
             val distSq = golem.location.distanceSquared(current.location)
-            if (distSq <= 12.25 && fastAttackCooldownTicks <= 0) { // Within 3.5 blocks reach
+            if (distSq <= 14.0 && fastAttackCooldownTicks <= 0) {
                 fastAttackCooldownTicks = config.attackCadenceTicks // 12 ticks
                 golem.swingMainHand()
                 golem.attack(current)
             }
         }
 
-        // 20-Tick (1s) Loop: MaxCombatDistance (256.0) & SmashMech Trigger
+        // 20-Tick (1s) Loop: MaxCombatDistance (256.0), Health Sync, Pursuit & SmashMech Trigger
         runTimer(20L, 20L) {
-            if (!golem.isValid || golem.isDead || isDying || isPerformingSmash) return@runTimer
+            if (isDying || isPerformingSmash) return@runTimer
+            if (!ensureLiveGolem() || golem.isDead) return@runTimer
 
-            if (golem.location.distanceSquared(patrolAnchor) > config.maxCombatDistanceSquared) {
+            golem.persistentDataContainer.set(MobKeys.BOSS_CUSTOM_HEALTH, PersistentDataType.DOUBLE, golem.health)
+
+            if (golem.world == patrolAnchor.world &&
+                golem.location.distanceSquared(patrolAnchor) > config.maxCombatDistanceSquared
+            ) {
                 golem.teleport(patrolAnchor)
             }
 
@@ -186,24 +232,27 @@ class ActiveDreadnoughtFight(
             cachedTarget = target
             golem.target = target
 
-            val now = System.currentTimeMillis()
             val distSq = golem.location.distanceSquared(target.location)
+            if (distSq > 9.0) {
+                golem.pathfinder.moveTo(target, 1.15)
+            }
+
+            val now = System.currentTimeMillis()
             if (distSq <= config.smashGrabRangeSquared && (now - lastSmashMillis) >= config.smashCooldownMillis) {
-                if (Math.random() <= 0.50) {
-                    lastSmashMillis = now
-                    triggerGrabAndSlamAttack(target)
-                }
+                lastSmashMillis = now
+                triggerGrabAndSlamAttack(target)
             }
         }
 
-        // 40-Tick (2s) Loop: Passive Beacon Hum & 16x16 Allied Golem Healing Aura
+        // 40-Tick (2s) Loop: Audible Passive Beacon Hum & 16x16 Allied Golem Healing Aura
         runTimer(40L, 40L) {
-            if (!golem.isValid || golem.isDead || isDying) return@runTimer
+            if (isDying) return@runTimer
+            if (!ensureLiveGolem() || golem.isDead) return@runTimer
 
             val coreLoc = golem.location.add(0.0, 1.5, 0.0)
-            world.playSound(coreLoc, Sound.BLOCK_BEACON_AMBIENT, SoundCategory.NEUTRAL, 1.0f, 1.0f)
-            world.spawnParticle(Particle.DUST_COLOR_TRANSITION, coreLoc, 6, 0.3, 0.3, 0.3, 0.0, beaconCyanGold)
-            world.spawnParticle(Particle.END_ROD, coreLoc, 2, 0.25, 0.25, 0.25, 0.01)
+            world.playSound(coreLoc, Sound.BLOCK_BEACON_AMBIENT, SoundCategory.NEUTRAL, 3.5f, 1.0f)
+            world.spawnParticle(Particle.DUST_COLOR_TRANSITION, coreLoc, 8, 0.35, 0.35, 0.35, 0.0, beaconCyanGold)
+            world.spawnParticle(Particle.END_ROD, coreLoc, 3, 0.25, 0.25, 0.25, 0.01)
 
             if (!golem.hasPotionEffect(PotionEffectType.REGENERATION)) {
                 golem.addPotionEffect(
@@ -228,46 +277,53 @@ class ActiveDreadnoughtFight(
     }
 
     // ========================================================================
-    // GRAB-AND-SLAM ATTACK (SmashMech)
+    // GRAB-AND-SLAM ATTACK (SmashMech) WITH BOOSTED Y-KNOCKBACK
     // ========================================================================
 
     private fun triggerGrabAndSlamAttack(target: LivingEntity) {
         isPerformingSmash = true
 
         val dist = golem.location.distance(target.location)
-        if (dist > 5.0) {
-            val jumpDir = target.location.toVector().subtract(golem.location.toVector()).setY(0.0).normalize()
-            golem.velocity = jumpDir.multiply((dist * 0.14).coerceAtMost(1.6)).setY(0.65)
+        if (dist > 4.5) {
+            val jumpDir = target.location.toVector().subtract(golem.location.toVector()).setY(0.0)
+            if (jumpDir.lengthSquared() > 1e-4) jumpDir.normalize()
+            golem.velocity = jumpDir.multiply((dist * 0.16).coerceAtMost(1.6)).setY(0.65)
         }
 
-        val grabDelay = if (dist > 5.0) 12L else 1L
+        val grabDelay = if (dist > 4.5) 12L else 1L
         runLater(grabDelay) {
-            if (!golem.isValid || isDying || !target.isValid || target.isDead) {
+            if (!ensureLiveGolem() || isDying) {
+                isPerformingSmash = false
+                return@runLater
+            }
+
+            val grabTarget = if (target.isValid && !target.isDead) target else resolveHostileTarget()
+            if (grabTarget == null) {
                 isPerformingSmash = false
                 return@runLater
             }
 
             golem.swingMainHand()
             golem.velocity = Vector(0.0, 1.0, 0.0)
-            world.playSound(golem.location, Sound.ENTITY_IRON_GOLEM_ATTACK, SoundCategory.NEUTRAL, 2.0f, 0.6f)
-            world.playSound(golem.location, Sound.BLOCK_BEACON_POWER_SELECT, SoundCategory.NEUTRAL, 2.0f, 1.5f)
+            world.playSound(golem.location, Sound.ENTITY_IRON_GOLEM_ATTACK, SoundCategory.NEUTRAL, 2.5f, 0.6f)
+            world.playSound(golem.location, Sound.BLOCK_BEACON_POWER_SELECT, SoundCategory.NEUTRAL, 2.5f, 1.5f)
 
             var holdTick = 0
             var holdTask: BukkitTask? = null
             holdTask = runTimer(1L, 1L) {
                 holdTick++
-                if (!golem.isValid || isDying) {
+                if (!ensureLiveGolem() || isDying) {
                     holdTask?.cancel()
                     isPerformingSmash = false
                     return@runTimer
                 }
 
-                if (holdTick <= 22 && target.isValid && !target.isDead) {
+                if (holdTick <= 22 && grabTarget.isValid && !grabTarget.isDead) {
                     val overheadLoc = golem.location.clone().add(0.0, 3.1, 0.0)
-                    overheadLoc.yaw = target.location.yaw
-                    overheadLoc.pitch = target.location.pitch
-                    target.teleport(overheadLoc)
-                    target.velocity = Vector(0.0, 0.0, 0.0)
+                    overheadLoc.yaw = grabTarget.location.yaw
+                    overheadLoc.pitch = grabTarget.location.pitch
+                    grabTarget.teleport(overheadLoc)
+                    grabTarget.velocity = Vector(0.0, 0.0, 0.0)
 
                     world.spawnParticle(Particle.ELECTRIC_SPARK, overheadLoc.clone().add(0.0, 0.5, 0.0), 5, 0.4, 0.4, 0.4, 0.05)
                     world.spawnParticle(Particle.DUST_COLOR_TRANSITION, overheadLoc, 4, 0.3, 0.3, 0.3, 0.0, beaconCyanGold)
@@ -279,8 +335,11 @@ class ActiveDreadnoughtFight(
 
                 if (holdTick >= 26) {
                     holdTask?.cancel()
-                    executeSlamImpact(target)
-                    isPerformingSmash = false
+                    try {
+                        executeSlamImpact(grabTarget)
+                    } finally {
+                        isPerformingSmash = false
+                    }
                 }
             }
         }
@@ -303,7 +362,8 @@ class ActiveDreadnoughtFight(
         if (grabbedTarget.isValid && !grabbedTarget.isDead) {
             grabbedTarget.teleport(slamOrigin)
             grabbedTarget.damage(config.smashPrimaryDamage, pierceSource) // 50.0 damage
-            grabbedTarget.velocity = Vector(0.0, 0.45, 0.0)
+            // Boosted primary target vertical rebound
+            grabbedTarget.velocity = Vector(0.0, 0.85, 0.0)
         }
 
         golem.swingMainHand()
@@ -332,7 +392,7 @@ class ActiveDreadnoughtFight(
             }
         }
 
-        // Hostile-Only AoE Damage (10.0 armor-ignoring) & Upward Throw within 8 blocks
+        // Hostile-Only AoE Damage (10.0 armor-ignoring) & Boosted Upward Throw (Y = 1.55) within 8 blocks
         val radiusSq = maxR * maxR
         slamOrigin.getNearbyLivingEntities(maxR, 5.0, maxR).forEach { entity ->
             if (entity == golem || entity == grabbedTarget) return@forEach
@@ -344,7 +404,7 @@ class ActiveDreadnoughtFight(
                 entity.damage(config.smashAoeDamage, pierceSource)
                 val pushDir = entity.location.toVector().subtract(slamOrigin.toVector()).setY(0.0)
                 if (pushDir.lengthSquared() > 1e-4) pushDir.normalize()
-                entity.velocity = pushDir.multiply(1.3).setY(1.15)
+                entity.velocity = pushDir.multiply(1.3).setY(1.55)
             }
         }
     }
@@ -363,7 +423,6 @@ class ActiveDreadnoughtFight(
         if ((now - lastBashMillis) < config.bashCooldownMillis) return
         lastBashMillis = now
 
-        // 20 hearts (40.0 HP) damage
         event.damage = config.bashDamage
 
         val tLoc = target.location.add(0.0, 1.0, 0.0)
@@ -393,36 +452,43 @@ class ActiveDreadnoughtFight(
     }
 
     // ========================================================================
-    // BEACON DEATH ANIMATION
+    // BEACON DEATH ANIMATION (CHUNK-UNLOAD SAFE)
     // ========================================================================
 
     fun triggerBeaconDeathAnimation() {
         if (isDying) return
         isDying = true
 
+        ensureLiveGolem()
         cancelAllTasks()
-        plugin.bossBarManager.unregisterEntity(golem)
+        plugin.bossBarManager.unregisterById(golemId)
 
+        // Strip Regeneration and all active potion effects immediately
+        golem.clearActivePotionEffects()
         golem.health = 1.0
         golem.setAI(false)
         golem.isInvulnerable = true
         golem.velocity = Vector(0.0, 0.0, 0.0)
 
-        val origin = golem.location.clone()
-        val coreLoc = origin.clone().add(0.0, 1.5, 0.0)
-
-        world.playSound(coreLoc, Sound.BLOCK_BEACON_DEACTIVATE, SoundCategory.NEUTRAL, 2.5f, 1.0f)
+        var lastCoreLoc = golem.location.clone().add(0.0, 1.5, 0.0)
+        world.playSound(lastCoreLoc, Sound.BLOCK_BEACON_DEACTIVATE, SoundCategory.NEUTRAL, 3.0f, 1.0f)
 
         var tick = 0
         var deathTask: BukkitTask? = null
         deathTask = Bukkit.getScheduler().runTaskTimer(plugin, Runnable {
             tick++
-            if (!golem.isValid || tick > 40) {
+            // If the chunk unloads mid-death-animation or 40 ticks complete, finish climax & removal immediately!
+            if (!ensureLiveGolem() || tick >= 40) {
                 deathTask?.cancel()
+                if (golem.isValid) {
+                    lastCoreLoc = golem.location.clone().add(0.0, 1.5, 0.0)
+                }
+                detonateBeaconCoreClimax(lastCoreLoc)
                 return@Runnable
             }
 
             val currentCore = golem.location.add(0.0, 1.5, 0.0)
+            lastCoreLoc = currentCore.clone()
             val ringRadius = 0.5 + (tick / 40.0) * 2.0
 
             for (i in 0 until 10) {
@@ -433,38 +499,35 @@ class ActiveDreadnoughtFight(
             }
 
             if (tick % 10 == 0) {
-                val pitch = 1.0f - (tick / 60.0f)
-                world.playSound(currentCore, Sound.BLOCK_BEACON_DEACTIVATE, SoundCategory.NEUTRAL, 2.0f, pitch)
-                world.playSound(currentCore, Sound.ENTITY_IRON_GOLEM_HURT, SoundCategory.NEUTRAL, 2.0f, pitch)
-            }
-
-            if (tick == 40) {
-                deathTask?.cancel()
-                detonateBeaconCoreClimax(currentCore)
+                val pitch = (1.0f - (tick / 60.0f)).coerceAtLeast(0.5f)
+                world.playSound(currentCore, Sound.BLOCK_BEACON_DEACTIVATE, SoundCategory.NEUTRAL, 2.5f, pitch)
+                world.playSound(currentCore, Sound.ENTITY_IRON_GOLEM_HURT, SoundCategory.NEUTRAL, 2.5f, pitch)
             }
         }, 1L, 1L)
     }
 
     private fun detonateBeaconCoreClimax(coreLoc: Location) {
-        world.playSound(coreLoc, Sound.BLOCK_BEACON_DEACTIVATE, SoundCategory.NEUTRAL, 3.0f, 0.5f)
-        world.playSound(coreLoc, Sound.BLOCK_GLASS_BREAK, SoundCategory.BLOCKS, 3.0f, 0.7f)
-        world.playSound(coreLoc, Sound.ENTITY_IRON_GOLEM_DEATH, SoundCategory.NEUTRAL, 2.5f, 0.8f)
+        try {
+            val targetWorld = coreLoc.world ?: world
+            targetWorld.playSound(coreLoc, Sound.BLOCK_BEACON_DEACTIVATE, SoundCategory.NEUTRAL, 3.5f, 0.55f)
+            targetWorld.playSound(coreLoc, Sound.BLOCK_GLASS_BREAK, SoundCategory.BLOCKS, 3.0f, 0.7f)
+            targetWorld.playSound(coreLoc, Sound.ENTITY_IRON_GOLEM_DEATH, SoundCategory.NEUTRAL, 2.5f, 0.8f)
 
-        world.spawnParticle(Particle.FLASH, coreLoc, 2)
-        world.spawnParticle(Particle.END_ROD, coreLoc, 120, 1.2, 1.2, 1.2, 0.25)
-        world.spawnParticle(Particle.ELECTRIC_SPARK, coreLoc, 100, 1.5, 1.5, 1.5, 0.2)
-        world.spawnParticle(Particle.BLOCK, coreLoc, 80, 1.0, 1.2, 1.0, 0.15, Material.BEACON.createBlockData())
-        world.spawnParticle(Particle.BLOCK, coreLoc, 80, 1.0, 1.2, 1.0, 0.15, Material.IRON_BLOCK.createBlockData())
+            targetWorld.spawnParticle(Particle.FLASH, coreLoc, 2, 0.0, 0.0, 0.0, 0.0, beaconCyanColor)
+            targetWorld.spawnParticle(Particle.END_ROD, coreLoc, 120, 1.2, 1.2, 1.2, 0.25)
+            targetWorld.spawnParticle(Particle.ELECTRIC_SPARK, coreLoc, 100, 1.5, 1.5, 1.5, 0.2)
+            targetWorld.spawnParticle(Particle.BLOCK, coreLoc, 80, 1.0, 1.2, 1.0, 0.15, Material.BEACON.createBlockData())
+            targetWorld.spawnParticle(Particle.BLOCK, coreLoc, 80, 1.0, 1.2, 1.0, 0.15, Material.IRON_BLOCK.createBlockData())
 
-        // Drop 1x Beacon
-        world.dropItemNaturally(coreLoc, ItemStack(Material.BEACON, 1)) { item ->
-            item.isGlowing = true
-            item.velocity = item.velocity.add(Vector(0.0, 0.25, 0.0))
+            // Drop 1x Beacon
+            targetWorld.dropItemNaturally(coreLoc, ItemStack(Material.BEACON, 1)) { item ->
+                item.isGlowing = true
+                item.velocity = item.velocity.add(Vector(0.0, 0.25, 0.0))
+            }
+        } finally {
+            forceCleanup(killGolem = true)
+            plugin.dreadnoughtManager.activeFights.remove(golemId)
         }
-
-        val id = golem.uniqueId
-        forceCleanup(killGolem = true)
-        plugin.dreadnoughtManager.activeFights.remove(id)
     }
 
     // ========================================================================
@@ -485,7 +548,7 @@ class ActiveDreadnoughtFight(
         if (current != null && current.isValid && !current.isDead && isHostileEnemy(current)) {
             return current
         }
-        return golem.location.getNearbyLivingEntities(config.followRange) // 64.0
+        return golem.location.getNearbyLivingEntities(config.followRange)
             .filter { !it.isDead && isHostileEnemy(it) }
             .minByOrNull { it.location.distanceSquared(golem.location) }
     }
@@ -496,9 +559,13 @@ class ActiveDreadnoughtFight(
 
     fun forceCleanup(killGolem: Boolean) {
         cancelAllTasks()
-        plugin.bossBarManager.unregisterEntity(golem)
-        if (killGolem && golem.isValid) {
-            golem.remove()
+        plugin.bossBarManager.unregisterById(golemId)
+        if (killGolem) {
+            if (golem.isValid) {
+                golem.remove()
+            } else {
+                (Bukkit.getEntity(golemId) as? IronGolem)?.remove()
+            }
         }
     }
 

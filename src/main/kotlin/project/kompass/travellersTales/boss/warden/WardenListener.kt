@@ -1,6 +1,7 @@
 package project.kompass.travellersTales.boss.warden
 
 import org.bukkit.*
+import org.bukkit.block.Block
 import org.bukkit.damage.DamageType
 import org.bukkit.entity.*
 import org.bukkit.event.EventHandler
@@ -23,6 +24,17 @@ class WardenListener(
     private val plugin: TravellersTales,
     private val manager: WardenManager
 ) : Listener {
+
+    companion object {
+        private val SCULK_MATERIALS = setOf(
+            Material.SCULK,
+            Material.SCULK_VEIN,
+            Material.SCULK_CATALYST,
+            Material.SCULK_SHRIEKER,
+            Material.SCULK_SENSOR,
+            Material.CALIBRATED_SCULK_SENSOR
+        )
+    }
 
     private val parasiteSpawnCooldowns = HashMap<UUID, Long>()
 
@@ -64,7 +76,7 @@ class WardenListener(
                 val mins = remainingSec / 60
                 val secs = remainingSec % 60
                 gracedPlayer.sendActionBar(
-                    "<bold><#00A8FF>[The Warden]</#00A8FF></bold> <aqua>Sculk is dormant (${mins}m ${secs}s grace remaining)</aqua>".mm()
+                    "<bold><#0047AB>[The Warden]</#0047AB></bold> <aqua>Sculk is dormant (${mins}m ${secs}s grace remaining)</aqua>".mm()
                 )
                 return
             }
@@ -98,7 +110,7 @@ class WardenListener(
             return
         }
 
-        // Case 2: Phase 2 Sculk Parasite spawning on sprinting/jumping over Sculk
+        // Case 2: Phase 2 Sculk Parasite spawning on moving/jumping over any Sculk block
         if (gameEvent != GameEvent.STEP && gameEvent != GameEvent.HIT_GROUND) return
 
         val player = event.entity as? Player ?: return
@@ -109,9 +121,7 @@ class WardenListener(
         val isJumpingLand = (gameEvent == GameEvent.HIT_GROUND)
         if (!isSprintingStep && !isJumpingLand) return
 
-        val feetBlock = player.location.block
-        val underBlock = player.location.clone().subtract(0.0, 0.1, 0.0).block
-        if (feetBlock.type != Material.SCULK && underBlock.type != Material.SCULK) return
+        if (!isTouchingSculk(player.location)) return
 
         val fight = manager.findNearestPhase2Fight(player.location, 64.0) ?: return
 
@@ -123,17 +133,36 @@ class WardenListener(
         fight.spawnSculkParasites(player.location)
     }
 
+    private fun isTouchingSculk(loc: Location): Boolean {
+        val feet: Block = loc.block
+        if (feet.type in SCULK_MATERIALS) return true
+        val below: Block = loc.clone().subtract(0.0, 0.25, 0.0).block
+        if (below.type in SCULK_MATERIALS) return true
+        for (dx in -1..1) {
+            for (dz in -1..1) {
+                if (below.getRelative(dx, 0, dz).type in SCULK_MATERIALS ||
+                    feet.getRelative(dx, 0, dz).type in SCULK_MATERIALS
+                ) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     fun onWardenCombat(event: EntityDamageByEntityEvent) {
         val damagedWarden = event.entity as? Warden
         if (damagedWarden != null) {
             val fight = manager.getFight(damagedWarden) ?: return
+            fight.warden = damagedWarden
 
             if (fight.isTransitionInvulnerable || fight.isDying) {
                 event.isCancelled = true
                 return
             }
 
+            fight.lastCombatTimestamp = System.currentTimeMillis()
             val damager = event.damager
 
             // Phase 3 Heartbeat Parry Counter Check (ticks 50..65)
@@ -167,14 +196,15 @@ class WardenListener(
         val attackingWarden = event.damager as? Warden
         if (attackingWarden != null) {
             val fight = manager.getFight(attackingWarden) ?: return
+            fight.warden = attackingWarden
             if (fight.isDying) {
                 event.isCancelled = true
                 return
             }
             fight.lastCombatTimestamp = System.currentTimeMillis()
 
-            // Extend vanilla Sonic Boom by +10 blocks and damage any mobs caught inside
-            if (event.damageSource.damageType == DamageType.SONIC_BOOM) {
+            // Guard with !fight.isFiringExtendedBoom to prevent recursive SONIC_BOOM StackOverflowError!
+            if (event.damageSource.damageType == DamageType.SONIC_BOOM && !fight.isFiringExtendedBoom) {
                 val targetLoc = (event.entity as? LivingEntity)?.eyeLocation ?: event.entity.location
                 fight.fireExtendedSonicBoomRay(targetLoc, includePrimaryTargetDamage = false)
             }
@@ -185,6 +215,7 @@ class WardenListener(
     fun onWardenGeneralDamage(event: EntityDamageEvent) {
         val warden = event.entity as? Warden ?: return
         val fight = manager.getFight(warden) ?: return
+        fight.warden = warden
 
         if (fight.isTransitionInvulnerable || fight.isDying) {
             event.isCancelled = true

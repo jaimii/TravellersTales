@@ -25,6 +25,17 @@ class CubeBossManager(private val plugin: TravellersTales) {
     init {
         reloadConfig()
         registerSpawnEggRecipes()
+
+        // Re-attach any existing World Slime or Magma Core in loaded worlds on startup/reload
+        Bukkit.getScheduler().runTask(plugin, Runnable {
+            for (world in Bukkit.getWorlds()) {
+                for (cube in world.getEntitiesByClass(AbstractCubeMob::class.java)) {
+                    if (isCubeBossEntity(cube)) {
+                        rebindOrRestoreCube(cube)
+                    }
+                }
+            }
+        })
     }
 
     fun reloadConfig() {
@@ -39,6 +50,52 @@ class CubeBossManager(private val plugin: TravellersTales) {
 
     fun getSettings(type: CubeBossType): CubeBossSettings =
         settingsMap[type] ?: CubeBossSettings.load(plugin.config, type)
+
+    fun isCubeBossEntity(entity: Entity): Boolean {
+        val mobId = entity.persistentDataContainer.get(MobKeys.MOB_ID, PersistentDataType.STRING)
+        return mobId == CubeBossType.WORLD_SLIME.mobId || mobId == CubeBossType.MAGMA_CORE.mobId
+    }
+
+    /**
+     * Re-binds a World Slime or Magma Core when its chunk reloads, or restores its
+     * ActiveCubeBossFight from disk if it is not yet in [activeFights].
+     */
+    fun rebindOrRestoreCube(cube: AbstractCubeMob): ActiveCubeBossFight? {
+        if (!cube.isValid || cube.isDead) return null
+
+        val targetId = cube.uniqueId
+        val existing = activeFights.firstOrNull { fight ->
+            fight.activeCubes.any { it.uniqueId == targetId }
+        }
+        if (existing != null) {
+            existing.rebindCube(cube)
+            return existing
+        }
+
+        val mobId = cube.persistentDataContainer.get(MobKeys.MOB_ID, PersistentDataType.STRING) ?: return null
+        val type = CubeBossType.entries.firstOrNull { it.mobId == mobId } ?: return null
+        val settings = getSettings(type)
+
+        // If a Phase 2 twin is already restored for this boss type nearby, attach the second twin to the same fight
+        if (cube.size <= settings.phase2Size) {
+            val nearbyTwinFight = activeFights.firstOrNull {
+                it.type == type && it.currentPhase == 2 && it.world == cube.world &&
+                        it.spawnOrigin.distanceSquared(cube.location) <= settings.maxCombatDistanceSquared
+            }
+            if (nearbyTwinFight != null) {
+                if (nearbyTwinFight.activeCubes.none { it.uniqueId == cube.uniqueId }) {
+                    nearbyTwinFight.activeCubes.add(cube)
+                }
+                plugin.bossBarManager.createBossBar(cube, settings.bossBar.copy(title = settings.bossBar.phase2Title))
+                return nearbyTwinFight
+            }
+        }
+
+        val restoredFight = ActiveCubeBossFight(plugin, type, cube.world, cube.location.clone(), settings)
+        activeFights.add(restoredFight)
+        restoredFight.restoreFromLoadedCube(cube)
+        return restoredFight
+    }
 
     fun createBossSpawnEgg(type: CubeBossType): ItemStack {
         val eggMaterial = if (type == CubeBossType.WORLD_SLIME) {
@@ -133,7 +190,20 @@ class CubeBossManager(private val plugin: TravellersTales) {
 
     fun getFightByEntity(entity: Entity): ActiveCubeBossFight? {
         if (entity !is AbstractCubeMob) return null
-        return activeFights.firstOrNull { entity in it.activeCubes }
+        val targetId = entity.uniqueId
+        val existing = activeFights.firstOrNull { fight ->
+            fight.activeCubes.any { it.uniqueId == targetId }
+        }
+        if (existing != null) {
+            if (entity.isValid) {
+                existing.rebindCube(entity)
+            }
+            return existing
+        }
+        if (isCubeBossEntity(entity)) {
+            return rebindOrRestoreCube(entity)
+        }
+        return null
     }
 
     fun unregisterFight(fight: ActiveCubeBossFight) {

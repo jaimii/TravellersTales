@@ -34,10 +34,11 @@ import kotlin.random.Random
 
 class ActiveTravellerFight(
     private val plugin: TravellersTales,
-    val entity: WitherSkeleton,
+    var entity: WitherSkeleton,
     var config: TravellerConfig,
     val huntedPlayerId: UUID? = null
 ) {
+    val travellerId: UUID = entity.uniqueId
     val world: World = entity.world
     private val tasks = mutableListOf<BukkitTask>()
     private var travellerTeam: Team? = null
@@ -60,6 +61,7 @@ class ActiveTravellerFight(
 
     // Pathfinding throttle state
     private var pathfindingCooldownTicks: Int = 0
+    private var combatPathCooldownTicks: Int = 0
     private var lastStalkTargetLoc: Location? = null
 
     // Shield State Tracking
@@ -80,6 +82,12 @@ class ActiveTravellerFight(
         shieldDisabledUntilTick = Bukkit.getCurrentTick() + ticks
     }
 
+    fun rebindEntity(loaded: WitherSkeleton) {
+        this.entity = loaded
+        travellerTeam?.addEntity(loaded)
+        plugin.bossBarManager.rebindEntity(loaded)
+    }
+
     fun start() {
         setupTeam()
         configureEntity()
@@ -91,7 +99,7 @@ class ActiveTravellerFight(
 
     private fun setupTeam() {
         val scoreboard = Bukkit.getScoreboardManager().mainScoreboard
-        val teamName = "Trav_${entity.uniqueId.toString().take(8)}"
+        val teamName = "Trav_${travellerId.toString().take(8)}"
         scoreboard.getTeam(teamName)?.unregister()
         travellerTeam = scoreboard.registerNewTeam(teamName).apply {
             setAllowFriendlyFire(false)
@@ -104,13 +112,16 @@ class ActiveTravellerFight(
         entity.persistentDataContainer.set(MobKeys.MOB_ID, PersistentDataType.STRING, "the_traveller")
         entity.customName(config.displayName.mm())
         entity.isCustomNameVisible = true
-        entity.isPersistent = true
-        entity.removeWhenFarAway = false
+
+        // Despawnable when chunk unloads (treated as player escaped -> spawns next night!)
+        entity.isPersistent = false
+        entity.removeWhenFarAway = true
         entity.isGlowing = true
 
         entity.getAttribute(Attribute.MAX_HEALTH)?.baseValue = config.maxHealth
         entity.health = config.maxHealth
         entity.getAttribute(Attribute.MOVEMENT_SPEED)?.baseValue = config.movementSpeed
+        entity.getAttribute(Attribute.ATTACK_DAMAGE)?.baseValue = 12.0
         entity.getAttribute(Attribute.FOLLOW_RANGE)?.baseValue = config.followRange // 64.0
         entity.getAttribute(Attribute.KNOCKBACK_RESISTANCE)?.baseValue = 0.6
     }
@@ -164,25 +175,28 @@ class ActiveTravellerFight(
     }
 
     private fun scheduleCoreLoops() {
-        // 2-Tick Loop: Ambient particles & Stalking positioning
+        // 2-Tick Loop: Ambient particles, Stalking positioning (unprovoked), or Combat Pursuit (provoked)
         runTimer(2L, 2L) {
             if (!entity.isValid || entity.isDead) return@runTimer
             tickCircularAmbientParticles()
 
-            // If unprovoked, face player and maintain stalking distance
             if (!isProvoked) {
                 entity.target = null
-                val player = resolveHuntedPlayer() ?: return@runTimer
+                val player = resolveHuntedPlayer() ?: resolveNearestSurvivalPlayer() ?: return@runTimer
                 faceTarget(player.eyeLocation)
                 tickStalkingMovement(player)
+            } else {
+                val target = resolveCombatTarget() ?: return@runTimer
+                tickCombatPursuit(target)
             }
         }
 
-        // 20-Tick (1s) Combat & MaxCombatDistance / Escape Detection Loop
-        runTimer(20L, 20L) {
-            if (!entity.isValid || entity.isDead) return@runTimer
+        // 10-Tick (0.5s) Combat Skill & Chunk-Unload / Escape Detection Loop
+        runTimer(10L, 10L) {
+            if (entity.isDead) return@runTimer
 
-            if (checkHuntedPlayerEscaped()) {
+            // If The Traveller's chunk unloaded (!entity.isValid), treat as player escaped -> spawns next night!
+            if (!entity.isValid || checkHuntedPlayerEscaped()) {
                 plugin.travellerManager.handlePlayerEscaped(this)
                 return@runTimer
             }
@@ -193,50 +207,49 @@ class ActiveTravellerFight(
             if (!isProvoked) return@runTimer
 
             val target = resolveCombatTarget() ?: return@runTimer
+            entity.target = target
+
             if (isTeleporting || isSpinning) return@runTimer
 
             val now = System.currentTimeMillis()
             val distSq = entity.location.distanceSquared(target.location)
 
-            // Shield Bash if shield is down
-            if (!isShieldActive() && distSq <= 25.0 && (now - lastShieldBashMillis) >= config.shieldBashCooldownMillis) {
+            // 1. Shield Bash if shield is disabled and target is within 6 blocks
+            if (!isShieldActive() && distSq <= 36.0 && (now - lastShieldBashMillis) >= config.shieldBashCooldownMillis) {
                 performShieldBash(target)
                 return@runTimer
             }
 
-            // Swirl Mace Attack
-            if (distSq <= 25.0 && (now - lastSwirlMillis) >= config.swirlAttackCooldownMillis) {
+            // 2. Swirl Mace Attack within 7 blocks
+            if (distSq <= 49.0 && (now - lastSwirlMillis) >= config.swirlAttackCooldownMillis) {
                 lastSwirlMillis = now
-                triggerSwirlMaceAttack()
+                triggerSwirlMaceAttack(target)
                 return@runTimer
             }
 
-            // Homing Wither Skull Shower
-            if (distSq <= 400.0 && (now - lastSkullBarrageMillis) >= config.skullBarrageCooldownMillis) {
-                if (Random.nextDouble() <= 0.80) {
-                    lastSkullBarrageMillis = now
-                    triggerHomingWitherSkullShower(target)
-                }
+            // 3. Homing Wither Skull Shower within 35 blocks
+            if (distSq in 9.0..1225.0 && (now - lastSkullBarrageMillis) >= config.skullBarrageCooldownMillis) {
+                lastSkullBarrageMillis = now
+                triggerHomingWitherSkullShower(target)
             }
         }
 
-        // 400-Tick (20s) Ambient stare
-        runTimer(400L, 400L) {
+        // 160-Tick (8s) Audible Enderman Stare Loop
+        runTimer(160L, 160L) {
             if (!entity.isValid || entity.isDead) return@runTimer
-            if (Random.nextDouble() <= 0.50) {
-                world.playSound(entity.location, Sound.ENTITY_ENDERMAN_STARE, SoundCategory.HOSTILE, 1f, 0.2f)
+            if (Random.nextDouble() <= 0.65) {
+                world.playSound(entity.location, Sound.ENTITY_ENDERMAN_STARE, SoundCategory.HOSTILE, 2.0f, 0.6f)
             }
         }
     }
 
     // ========================================================================
-    // STALKING & PROVOCATION (THROTTLED PATHFINDING)
+    // STALKING, PROVOCATION & ACTIVE COMBAT PURSUIT
     // ========================================================================
 
     private fun tickStalkingMovement(player: Player) {
         val dist = entity.location.distance(player.location)
 
-        // Throttle pathfinding: update at most every 15 ticks unless player moved > 4 blocks
         if (pathfindingCooldownTicks > 0) {
             pathfindingCooldownTicks--
             val lastLoc = lastStalkTargetLoc
@@ -255,10 +268,10 @@ class ActiveTravellerFight(
                 val backDir = entity.location.toVector().subtract(player.location.toVector()).setY(0.0)
                 if (backDir.lengthSquared() > 1e-4) backDir.normalize()
                 val backLoc = entity.location.clone().add(backDir.multiply(4.0))
-                entity.pathfinder.moveTo(backLoc, 0.8)
+                entity.pathfinder.moveTo(backLoc, 0.85)
             }
             dist > 18.0 -> {
-                entity.pathfinder.moveTo(player.location, 0.9)
+                entity.pathfinder.moveTo(player.location, 0.95)
             }
             else -> {
                 entity.pathfinder.stopPathfinding()
@@ -266,17 +279,44 @@ class ActiveTravellerFight(
         }
     }
 
+    private fun tickCombatPursuit(target: LivingEntity) {
+        entity.target = target
+        if (isSpinning) return
+
+        val distSq = entity.location.distanceSquared(target.location)
+        if (distSq <= 6.25) {
+            faceTarget(target.eyeLocation)
+        }
+
+        if (combatPathCooldownTicks > 0) {
+            combatPathCooldownTicks--
+            return
+        }
+        combatPathCooldownTicks = 6
+
+        if (distSq > 3.0) {
+            entity.pathfinder.moveTo(target, 1.15)
+        }
+    }
+
     fun provoke(attacker: LivingEntity?) {
         if (isProvoked) return
         isProvoked = true
+        combatPathCooldownTicks = 0
 
-        world.playSound(entity.location, Sound.ENTITY_ENDERMAN_SCREAM, SoundCategory.HOSTILE, 1.8f, 0.3f)
-        world.playSound(entity.location, Sound.BLOCK_BELL_RESONATE, SoundCategory.HOSTILE, 2.0f, 0.5f)
-        world.spawnParticle(Particle.DUST_COLOR_TRANSITION, entity.location.add(0.0, 1.2, 0.0), 50, 0.8, 1.0, 0.8, 0.1, riftTransition)
+        world.playSound(entity.location, Sound.ENTITY_ENDERMAN_SCREAM, SoundCategory.HOSTILE, 2.5f, 0.65f)
+        world.playSound(entity.location, Sound.BLOCK_BELL_RESONATE, SoundCategory.HOSTILE, 2.0f, 0.6f)
+        world.spawnParticle(
+            Particle.DUST_COLOR_TRANSITION,
+            entity.location.add(0.0, 1.2, 0.0),
+            50, 0.8, 1.0, 0.8, 0.1,
+            riftTransition
+        )
 
-        val target = attacker ?: resolveHuntedPlayer()
+        val target = attacker ?: resolveHuntedPlayer() ?: resolveNearestSurvivalPlayer()
         if (target != null) {
             entity.target = target
+            entity.pathfinder.moveTo(target, 1.15)
             if (target is Player) {
                 target.sendActionBar("<bold><red>The Traveller has been provoked!</red></bold>".mm())
             }
@@ -379,16 +419,17 @@ class ActiveTravellerFight(
     }
 
     // ========================================================================
-    // COMBAT EVENTS
+    // COMBAT EVENTS & SKILLS
     // ========================================================================
 
     fun onDamaged(attacker: LivingEntity?) {
         provoke(attacker)
-        world.playSound(entity.location, Sound.ENTITY_ENDERMAN_HURT, SoundCategory.HOSTILE, 1f, 0.2f)
+        world.playSound(entity.location, Sound.ENTITY_ENDERMAN_HURT, SoundCategory.HOSTILE, 1.8f, 0.65f)
 
         val target = attacker ?: resolveCombatTarget() ?: return
+        entity.target = target
 
-        if (!isShieldActive() && entity.location.distanceSquared(target.location) <= 16.0) {
+        if (!isShieldActive() && entity.location.distanceSquared(target.location) <= 25.0) {
             val now = System.currentTimeMillis()
             if ((now - lastShieldBashMillis) >= config.shieldBashCooldownMillis) {
                 performShieldBash(target)
@@ -406,7 +447,7 @@ class ActiveTravellerFight(
     }
 
     fun onMeleeAttack(target: LivingEntity) {
-        world.playSound(target.location, Sound.ITEM_MACE_SMASH_GROUND, SoundCategory.HOSTILE, 1f, 0.2f)
+        world.playSound(target.location, Sound.ITEM_MACE_SMASH_GROUND, SoundCategory.HOSTILE, 1.5f, 0.75f)
         world.spawnParticle(
             Particle.DUST_COLOR_TRANSITION,
             target.location.add(0.0, 1.0, 0.0),
@@ -417,11 +458,14 @@ class ActiveTravellerFight(
 
     private fun triggerTravellerTeleport(target: LivingEntity) {
         isTeleporting = true
-        world.playSound(entity.location, Sound.ENTITY_EVOKER_PREPARE_ATTACK, SoundCategory.HOSTILE, 1.5f, 2.0f)
-        world.playSound(entity.location, Sound.BLOCK_BELL_USE, SoundCategory.HOSTILE, 1.5f, 2.0f)
+        world.playSound(entity.location, Sound.ENTITY_EVOKER_PREPARE_ATTACK, SoundCategory.HOSTILE, 1.8f, 1.6f)
+        world.playSound(entity.location, Sound.BLOCK_BELL_USE, SoundCategory.HOSTILE, 1.8f, 1.5f)
 
         runLater(10L) {
-            if (!entity.isValid) return@runLater
+            if (!entity.isValid) {
+                isTeleporting = false
+                return@runLater
+            }
             spawnParticleSphere(entity.location.add(0.0, 1.2, 0.0), radius = 3.5, points = 180)
         }
 
@@ -437,45 +481,69 @@ class ActiveTravellerFight(
 
         runLater(38L) {
             if (!entity.isValid) return@runLater
-            world.playSound(entity.location, Sound.BLOCK_END_GATEWAY_SPAWN, SoundCategory.HOSTILE, 1.5f, 0.5f)
-            world.playSound(entity.location, Sound.ITEM_TRIDENT_RETURN, SoundCategory.HOSTILE, 1.5f, 0.5f)
+            world.playSound(entity.location, Sound.BLOCK_END_GATEWAY_SPAWN, SoundCategory.HOSTILE, 1.8f, 0.6f)
+            world.playSound(entity.location, Sound.ITEM_TRIDENT_RETURN, SoundCategory.HOSTILE, 1.8f, 0.6f)
         }
 
         runLater(40L) {
-            if (!entity.isValid) return@runLater
-            val origin = entity.location.add(0.0, 1.2, 0.0)
-            world.spawnParticle(Particle.DUST_COLOR_TRANSITION, origin, 150, 1.4, 1.4, 1.4, 0.02, riftTransition)
-            world.spawnParticle(Particle.FLASH, origin, 1)
+            try {
+                if (!entity.isValid) return@runLater
+                val origin = entity.location.add(0.0, 1.2, 0.0)
+                world.spawnParticle(Particle.DUST_COLOR_TRANSITION, origin, 150, 1.4, 1.4, 1.4, 0.02, riftTransition)
+                world.spawnParticle(Particle.FLASH, origin, 1, 0.0, 0.0, 0.0, 0.0, goldColor)
 
-            val dest = if (target.isValid && target.world == world) {
-                findTeleportSpotAround(target.location, spreadRadius = 5.0)
-            } else {
-                entity.location
-            }
-
-            entity.teleport(dest)
-            world.playSound(dest, Sound.ENTITY_SHULKER_TELEPORT, SoundCategory.HOSTILE, 1.5f, 0.5f)
-            world.playSound(dest, Sound.ITEM_TRIDENT_RIPTIDE_3, SoundCategory.HOSTILE, 1.5f, 2.0f)
-
-            listOf(2L, 5L).forEach { postDelay ->
-                runLater(postDelay) {
-                    if (!entity.isValid) return@runLater
-                    val aLoc = entity.location.add(0.0, 1.2, 0.0)
-                    world.spawnParticle(Particle.DUST_COLOR_TRANSITION, aLoc, 100, 1.2, 1.2, 1.2, 0.0, gildedTransition)
-                    world.spawnParticle(Particle.PORTAL, aLoc, 80, 1.0, 1.0, 1.0, 0.2)
+                val currentTarget = if (target.isValid && target.world == world) {
+                    target
+                } else {
+                    resolveCombatTarget()
                 }
-            }
 
-            runLater(6L) { isTeleporting = false }
+                val dest = if (currentTarget != null && currentTarget.world == world) {
+                    findTeleportSpotAround(currentTarget.location, spreadRadius = 4.0)
+                } else {
+                    entity.location
+                }
+
+                entity.teleport(dest)
+                world.playSound(dest, Sound.ENTITY_ENDERMAN_TELEPORT, SoundCategory.HOSTILE, 2.0f, 0.7f)
+                world.playSound(dest, Sound.ENTITY_SHULKER_TELEPORT, SoundCategory.HOSTILE, 1.8f, 0.6f)
+                world.playSound(dest, Sound.ITEM_TRIDENT_RIPTIDE_3, SoundCategory.HOSTILE, 1.5f, 1.6f)
+
+                if (currentTarget != null) {
+                    entity.target = currentTarget
+                    entity.pathfinder.moveTo(currentTarget, 1.15)
+                }
+
+                listOf(2L, 5L).forEach { postDelay ->
+                    runLater(postDelay) {
+                        if (!entity.isValid) return@runLater
+                        val aLoc = entity.location.add(0.0, 1.2, 0.0)
+                        world.spawnParticle(Particle.DUST_COLOR_TRANSITION, aLoc, 100, 1.2, 1.2, 1.2, 0.0, gildedTransition)
+                        world.spawnParticle(Particle.PORTAL, aLoc, 80, 1.0, 1.0, 1.0, 0.2)
+                    }
+                }
+            } finally {
+                runLater(6L) { isTeleporting = false }
+            }
         }
     }
 
-    private fun triggerSwirlMaceAttack() {
+    private fun triggerSwirlMaceAttack(target: LivingEntity) {
         isSpinning = true
-        world.playSound(entity.location, Sound.ENTITY_PLAYER_ATTACK_WEAK, SoundCategory.HOSTILE, 1.5f, 1.0f)
+        world.playSound(entity.location, Sound.ENTITY_PLAYER_ATTACK_SWEEP, SoundCategory.HOSTILE, 1.8f, 0.8f)
+        world.playSound(entity.location, Sound.ENTITY_BREEZE_INHALE, SoundCategory.HOSTILE, 1.8f, 0.9f)
+
+        val lungeDir = target.location.toVector().subtract(entity.location.toVector()).setY(0.0)
+        if (lungeDir.lengthSquared() > 1e-4) {
+            lungeDir.normalize().multiply(0.55).setY(0.25)
+            entity.velocity = lungeDir
+        }
 
         runLater(10L) {
-            if (!entity.isValid) return@runLater
+            if (!entity.isValid) {
+                isSpinning = false
+                return@runLater
+            }
 
             var spinTick = 0
             var spinTask: BukkitTask? = null
@@ -487,6 +555,9 @@ class ActiveTravellerFight(
                 }
 
                 entity.setRotation(entity.yaw + 60f, entity.pitch)
+                if (spinTick % 2 == 0) {
+                    entity.swingMainHand()
+                }
                 if (spinTick == 1 || spinTick == 6) {
                     val pLoc = entity.location.add(0.0, 1.0, 0.0)
                     world.spawnParticle(Particle.CLOUD, pLoc, 7, 0.9, 0.9, 0.9, 0.0)
@@ -499,12 +570,14 @@ class ActiveTravellerFight(
                 if (!entity.isValid) return@runLater
 
                 val center = entity.location.add(0.0, 1.0, 0.0)
-                world.spawnParticle(Particle.CLOUD, center, 10, 0.9, 0.9, 0.9, 0.0)
-                world.playSound(center, Sound.ITEM_MACE_SMASH_GROUND, SoundCategory.HOSTILE, 2.0f, 0.8f)
+                entity.swingMainHand()
+                world.spawnParticle(Particle.CLOUD, center, 15, 1.2, 0.9, 1.2, 0.02)
+                world.playSound(center, Sound.ITEM_MACE_SMASH_GROUND, SoundCategory.HOSTILE, 2.2f, 0.8f)
+                world.playSound(center, Sound.ENTITY_PLAYER_ATTACK_SWEEP, SoundCategory.HOSTILE, 2.0f, 0.7f)
 
-                for (i in 0 until 5) {
-                    val angle = 2.0 * Math.PI * i / 5.0
-                    val ringPt = center.clone().add(cos(angle) * 1.5, 0.0, sin(angle) * 1.5)
+                for (i in 0 until 8) {
+                    val angle = 2.0 * Math.PI * i / 8.0
+                    val ringPt = center.clone().add(cos(angle) * 2.2, 0.0, sin(angle) * 2.2)
                     world.spawnParticle(Particle.SWEEP_ATTACK, ringPt, 3, 0.3, 0.1, 0.3, 0.0)
                     world.spawnParticle(Particle.DUST_COLOR_TRANSITION, ringPt, 10, 0.3, 0.2, 0.3, 0.0, riftTransition)
                 }
@@ -514,11 +587,11 @@ class ActiveTravellerFight(
                     .withDirectEntity(entity)
                     .build()
 
-                entity.location.getNearbyLivingEntities(2.5).forEach { victim ->
+                entity.location.getNearbyLivingEntities(4.0).forEach { victim ->
                     if (victim == entity) return@forEach
                     victim.damage(8.0, pierceSource)
                     val pushDir = victim.location.toVector().subtract(entity.location.toVector()).setY(0.0)
-                    if (pushDir.lengthSquared() > 1e-4) pushDir.normalize()
+                    if (pushDir.lengthSquared() > 1e-4) pushDir.normalize() else pushDir.setX(1.0)
                     victim.velocity = pushDir.multiply(1.4).setY(0.65)
                 }
             }
@@ -526,6 +599,7 @@ class ActiveTravellerFight(
     }
 
     private fun triggerHomingWitherSkullShower(primaryTarget: LivingEntity) {
+        world.playSound(entity.location, Sound.ENTITY_ENDERMAN_SCREAM, SoundCategory.HOSTILE, 1.6f, 0.75f)
         for (i in 0 until 3) {
             runLater(i * 10L) {
                 if (!entity.isValid || entity.isDead) return@runLater
@@ -534,23 +608,24 @@ class ActiveTravellerFight(
                 } else {
                     resolveCombatTarget() ?: return@runLater
                 }
+                entity.swingMainHand()
                 spawnHomingWitherSkull(currentTarget)
             }
         }
     }
 
     private fun spawnHomingWitherSkull(target: LivingEntity) {
-        val spawnLoc = entity.location.clone().add(0.0, 1.6, 0.0)
+        val spawnLoc = entity.eyeLocation.clone().add(entity.location.direction.normalize().multiply(0.8))
         val initialDir = target.location.clone().add(0.0, 1.1, 0.0)
             .toVector().subtract(spawnLoc.toVector()).normalize()
 
-        world.playSound(spawnLoc, Sound.ENTITY_WITHER_SHOOT, SoundCategory.HOSTILE, 1.5f, 0.7f)
-        world.playSound(spawnLoc, Sound.ENTITY_BLAZE_SHOOT, SoundCategory.HOSTILE, 1.5f, 1.0f)
+        world.playSound(spawnLoc, Sound.ENTITY_WITHER_SHOOT, SoundCategory.HOSTILE, 1.8f, 0.75f)
+        world.playSound(spawnLoc, Sound.ENTITY_BLAZE_SHOOT, SoundCategory.HOSTILE, 1.8f, 1.0f)
 
         val skull = world.spawn(spawnLoc, WitherSkull::class.java, CreatureSpawnEvent.SpawnReason.CUSTOM) { ws ->
             ws.shooter = entity
             ws.persistentDataContainer.set(MobKeys.TRAVELLER_PROJECTILE, PersistentDataType.BYTE, 1)
-            ws.velocity = initialDir.clone().multiply(0.85)
+            ws.velocity = initialDir.clone().multiply(0.9)
         }
 
         var ticks = 0
@@ -558,7 +633,7 @@ class ActiveTravellerFight(
         homingTask = runTimer(1L, 1L) {
             ticks++
             if (!skull.isValid || skull.isDead || !target.isValid || target.isDead ||
-                ticks > 80 || skull.location.distanceSquared(spawnLoc) > 900.0
+                ticks > 80 || skull.location.distanceSquared(spawnLoc) > 1600.0
             ) {
                 if (skull.isValid) {
                     detonateHomingSkull(skull.location)
@@ -575,7 +650,7 @@ class ActiveTravellerFight(
                 val currentVel = skull.velocity
                 val currentDir = if (currentVel.lengthSquared() > 1e-4) currentVel.normalize() else desiredDir
                 val steered = currentDir.multiply(0.65).add(desiredDir.multiply(0.35)).normalize()
-                skull.velocity = steered.multiply(0.85)
+                skull.velocity = steered.multiply(0.9)
             }
 
             val sLoc = skull.location
@@ -594,7 +669,7 @@ class ActiveTravellerFight(
     }
 
     fun detonateHomingSkull(loc: Location) {
-        world.playSound(loc, Sound.ENTITY_DRAGON_FIREBALL_EXPLODE, SoundCategory.HOSTILE, 1.2f, 1.0f)
+        world.playSound(loc, Sound.ENTITY_DRAGON_FIREBALL_EXPLODE, SoundCategory.HOSTILE, 1.5f, 1.0f)
         world.spawnParticle(Particle.LAVA, loc, 15, 0.5, 0.5, 0.5, 0.0)
         world.spawnParticle(Particle.SOUL_FIRE_FLAME, loc, 25, 0.3, 0.3, 0.3, 0.12)
         world.spawnParticle(Particle.DUST_COLOR_TRANSITION, loc, 35, 0.6, 0.6, 0.6, 0.05, riftTransition)
@@ -615,7 +690,7 @@ class ActiveTravellerFight(
     fun playRiftVanishAndCleanup() {
         if (entity.isValid) {
             val loc = entity.location.add(0.0, 1.2, 0.0)
-            world.playSound(loc, Sound.ENTITY_ENDERMAN_TELEPORT, SoundCategory.HOSTILE, 2.0f, 0.5f)
+            world.playSound(loc, Sound.ENTITY_ENDERMAN_TELEPORT, SoundCategory.HOSTILE, 2.0f, 0.6f)
             world.spawnParticle(Particle.REVERSE_PORTAL, loc, 100, 0.8, 1.2, 0.8, 0.1)
             world.spawnParticle(Particle.DUST_COLOR_TRANSITION, loc, 80, 1.0, 1.2, 1.0, 0.05, crimsonTransition)
         }
@@ -623,7 +698,7 @@ class ActiveTravellerFight(
     }
 
     fun onDeath() {
-        world.playSound(entity.location, Sound.ENTITY_ENDERMAN_SCREAM, SoundCategory.HOSTILE, 1.5f, 0.2f)
+        world.playSound(entity.location, Sound.ENTITY_ENDERMAN_SCREAM, SoundCategory.HOSTILE, 2.0f, 0.6f)
         world.spawnParticle(
             Particle.DUST_COLOR_TRANSITION,
             entity.location.add(0.0, 1.0, 0.0),
@@ -635,7 +710,7 @@ class ActiveTravellerFight(
 
     fun forceCleanup(killEntity: Boolean) {
         cancelAllTasks()
-        plugin.bossBarManager.unregisterEntity(entity)
+        plugin.bossBarManager.unregisterById(travellerId)
         travellerTeam?.unregister()
         travellerTeam = null
 
@@ -645,26 +720,39 @@ class ActiveTravellerFight(
             }
         }
 
-        if (killEntity && entity.isValid) {
-            entity.remove()
+        if (killEntity) {
+            if (entity.isValid) {
+                entity.remove()
+            } else {
+                (Bukkit.getEntity(travellerId) as? WitherSkeleton)?.remove()
+            }
         }
     }
 
     private fun resolveHuntedPlayer(): Player? {
         val id = huntedPlayerId ?: return null
         val p = Bukkit.getPlayer(id)
-        return if (p != null && p.isOnline && !p.isDead && p.world == world) p else null
+        return if (p != null && p.isOnline && !p.isDead && p.world == world &&
+            (p.gameMode == GameMode.SURVIVAL || p.gameMode == GameMode.ADVENTURE)
+        ) p else null
     }
 
-    private fun resolveCombatTarget(): LivingEntity? {
-        val hunted = resolveHuntedPlayer()
-        if (hunted != null) return hunted
-
-        val current = entity.target
-        if (current != null && current.isValid && !current.isDead) return current
+    private fun resolveNearestSurvivalPlayer(): Player? {
         return entity.location.getNearbyPlayers(config.followRange)
             .filter { !it.isDead && (it.gameMode == GameMode.SURVIVAL || it.gameMode == GameMode.ADVENTURE) }
             .minByOrNull { it.location.distanceSquared(entity.location) }
+    }
+
+    private fun resolveCombatTarget(): LivingEntity? {
+        val current = entity.target
+        if (current != null && current.isValid && !current.isDead && current.world == world) {
+            if (current !is Player || (current.gameMode == GameMode.SURVIVAL || current.gameMode == GameMode.ADVENTURE)) {
+                return current
+            }
+        }
+        val hunted = resolveHuntedPlayer()
+        if (hunted != null) return hunted
+        return resolveNearestSurvivalPlayer()
     }
 
     private fun faceTarget(targetLocation: Location) {
@@ -689,14 +777,16 @@ class ActiveTravellerFight(
     }
 
     private fun findTeleportSpotAround(targetLoc: Location, spreadRadius: Double): Location {
-        repeat(10) {
-            val dx = Random.nextDouble(-spreadRadius, spreadRadius)
-            val dz = Random.nextDouble(-spreadRadius, spreadRadius)
+        repeat(12) {
+            val angle = Random.nextDouble(0.0, 2.0 * Math.PI)
+            val r = Random.nextDouble(2.0, spreadRadius)
+            val dx = cos(angle) * r
+            val dz = sin(angle) * r
             val candidate = targetLoc.clone().add(dx, 0.0, dz)
             for (dy in 2 downTo -3) {
                 val check = candidate.clone().add(0.0, dy.toDouble(), 0.0)
                 val ground = check.clone().add(0.0, -1.0, 0.0).block
-                if (ground.type.isSolid && check.block.isPassable && check.clone().add(0.0, 1.0, 0.0).block.isPassable) {
+                if (ground.type.isSolid && !ground.isLiquid && check.block.isPassable && check.clone().add(0.0, 1.0, 0.0).block.isPassable) {
                     val dir = targetLoc.toVector().subtract(check.toVector())
                     if (dir.lengthSquared() > 1e-4) check.setDirection(dir)
                     return check

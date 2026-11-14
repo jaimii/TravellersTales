@@ -36,6 +36,10 @@ data class WardenConfig(
     val phase3Threshold: Double get() = maxHealth * 0.33
 
     companion object {
+        private const val DEFAULT_DARK_BLUE_TITLE = "<bold><#0047AB>ᴛʜᴇ ᴡᴀʀᴅᴇɴ</#0047AB></bold>"
+        private const val DEFAULT_PHASE_2_DARK_BLUE_TITLE = "<bold><#003B8E>ᴛʜᴇ ᴡᴀʀᴅᴇɴ</#003B8E></bold>"
+        private const val DEFAULT_PHASE_3_DARK_BLUE_TITLE = "<bold><#002D6E>ᴛʜᴇ ᴡᴀʀᴅᴇɴ</#002D6E></bold>"
+
         fun load(config: FileConfiguration): WardenConfig {
             val sec = config.getConfigurationSection("warden")
             val barSec = sec?.getConfigurationSection("boss-bar")
@@ -46,13 +50,32 @@ data class WardenConfig(
             val blockName = p1Sec?.getString("tendril-block", "POINTED_DRIPSTONE") ?: "POINTED_DRIPSTONE"
             val tendrilMat = Material.matchMaterial(blockName) ?: Material.POINTED_DRIPSTONE
 
+            val rawTitle = barSec?.getString("title")
+            val title = if (rawTitle.isNullOrBlank() || rawTitle.contains("#00A8FF", ignoreCase = true)) {
+                DEFAULT_DARK_BLUE_TITLE
+            } else {
+                rawTitle
+            }
+
+            val rawP2Title = barSec?.getString("phase-2-title")
+            val p2Title = if (rawP2Title.isNullOrBlank() || rawP2Title.contains("ꜱʏᴍʙɪᴏᴛɪᴄ") || rawP2Title.contains("#0077FF", ignoreCase = true)) {
+                DEFAULT_PHASE_2_DARK_BLUE_TITLE
+            } else {
+                rawP2Title
+            }
+
+            val rawP3Title = barSec?.getString("phase-3-title")
+            val p3Title = if (rawP3Title.isNullOrBlank() || rawP3Title.contains("ᴜɴʙᴏᴜɴᴅ") || rawP3Title.contains("#00E5FF", ignoreCase = true)) {
+                DEFAULT_PHASE_3_DARK_BLUE_TITLE
+            } else {
+                rawP3Title
+            }
+
             val barSettings = BossBarSettings(
                 enabled = barSec?.getBoolean("enabled", true) ?: true,
-                title = barSec?.getString("title") ?: "<bold><#00A8FF>ᴛʜᴇ ᴡᴀʀᴅᴇɴ</#00A8FF></bold>",
-                phase2Title = barSec?.getString("phase-2-title")
-                    ?: "<bold><#0077FF>ᴛʜᴇ ᴡᴀʀᴅᴇɴ <gray>[</gray><aqua>ꜱʏᴍʙɪᴏᴛɪᴄ</aqua><gray>]</gray></#0077FF></bold>",
-                enragedTitle = barSec?.getString("phase-3-title")
-                    ?: "<bold><#00E5FF>ᴛʜᴇ ᴡᴀʀᴅᴇɴ <gray>[</gray><blue>ᴜɴʙᴏᴜɴᴅ</blue><gray>]</gray></#00E5FF></bold>",
+                title = title,
+                phase2Title = p2Title,
+                enragedTitle = p3Title,
                 color = BossBar.Color.BLUE,
                 phase2Color = BossBar.Color.BLUE,
                 enragedColor = BossBar.Color.BLUE,
@@ -76,7 +99,7 @@ data class WardenConfig(
                 snareDurationTicks = p1Sec?.getInt("snare-duration-ticks", 40) ?: 40,
                 transitionInvulnTicks = p2Sec?.getLong("transition-invuln-ticks", 100L) ?: 100L,
                 darknessRadius = p2Sec?.getDouble("darkness-radius", 128.0) ?: 128.0,
-                parasiteName = p2Sec?.getString("parasite-name") ?: "<bold><#00A8FF>Sculk Parasite</#00A8FF></bold>",
+                parasiteName = p2Sec?.getString("parasite-name") ?: "<bold><#0047AB>Sculk Parasite</#0047AB></bold>",
                 vibrationBeaconIntervalTicks = p2Sec?.getLong("vibration-beacon-interval-ticks", 30L) ?: 30L,
                 vibrationBeaconRadius = p2Sec?.getDouble("vibration-beacon-radius", 20.0) ?: 20.0,
                 seismicEchoIntervalTicks = p2Sec?.getLong("seismic-echo-interval-ticks", 400L) ?: 400L,

@@ -10,19 +10,18 @@ import org.bukkit.entity.Arrow
 import org.bukkit.entity.Mannequin
 import org.bukkit.entity.Player
 import org.bukkit.event.entity.CreatureSpawnEvent
-import org.bukkit.inventory.EquipmentSlot
 import org.bukkit.inventory.ItemStack
 import org.bukkit.persistence.PersistentDataType
 import org.bukkit.util.Vector
 import project.kompass.travellersTales.registry.MobKeys
-import project.kompass.travellersTales.util.mm
 import java.util.UUID
 
 class SteveMinionController(
-    val mannequin: Mannequin,
+    var mannequin: Mannequin,
     val isArcher: Boolean,
     val phaseTier: Int // 1 = Iron, 2 = Diamond, 3 = Netherite + Piercing Crossbow
 ) {
+    val steveId: UUID = mannequin.uniqueId
     private var attackCooldownTicks: Int = if (isArcher) 32 else 16
     var stunnedUntilTick: Int = 0
         private set
@@ -31,11 +30,23 @@ class SteveMinionController(
 
     fun stun(ticks: Int) {
         stunnedUntilTick = Bukkit.getCurrentTick() + ticks
-        mannequin.velocity = Vector(0.0, mannequin.velocity.y.coerceAtMost(0.0), 0.0)
+        if (mannequin.isValid) {
+            mannequin.velocity = Vector(0.0, mannequin.velocity.y.coerceAtMost(0.0), 0.0)
+        }
+    }
+
+    fun ensureLiveMannequin(): Boolean {
+        if (mannequin.isValid) return true
+        val live = Bukkit.getEntity(steveId) as? Mannequin
+        if (live != null && live.isValid) {
+            mannequin = live
+            return true
+        }
+        return false
     }
 
     fun tick(target: Player) {
-        if (!mannequin.isValid || mannequin.isDead) return
+        if (!ensureLiveMannequin() || mannequin.isDead) return
         if (isStunned()) {
             mannequin.world.spawnParticle(
                 Particle.CRIT,
@@ -93,7 +104,6 @@ class SteveMinionController(
             }
 
             if (distSq <= 900.0 && attackCooldownTicks <= 0) {
-                // Quick Charge 3 in Phase 3 fires faster (28t vs 45t)
                 attackCooldownTicks = if (phaseTier >= 3) 28 else 45
                 mannequin.swingMainHand()
                 val eye = mLoc.clone().add(0.0, 1.6, 0.0)
@@ -110,7 +120,7 @@ class SteveMinionController(
                         else -> 5.0
                     }
                     if (phaseTier >= 3) {
-                        arrow.pierceLevel = 4 // Piercing arrows in Phase 3
+                        arrow.pierceLevel = 4
                     }
                     arrow.pickupStatus = AbstractArrow.PickupStatus.DISALLOWED
                 }
@@ -128,8 +138,10 @@ class SteveMinionController(
                     .uuid(UUID.randomUUID())
                     .name("Steve")
                     .build()
-                m.customName("<aqua>Steve</aqua>".mm())
-                m.isCustomNameVisible = true
+
+                // No display name or description above Steve minions
+                m.customName(null)
+                m.isCustomNameVisible = false
                 m.description = null
                 m.isImmovable = false
                 m.setGravity(true)
@@ -137,7 +149,6 @@ class SteveMinionController(
                 m.getAttribute(Attribute.MAX_HEALTH)?.baseValue = 35.0
                 m.health = 35.0
 
-                // No visible armor worn, but full Iron / Diamond / Netherite armor attributes applied!
                 m.getAttribute(Attribute.ARMOR)?.baseValue = if (phaseTier >= 2) 20.0 else 15.0
                 m.getAttribute(Attribute.ARMOR_TOUGHNESS)?.baseValue = when (phaseTier) {
                     3 -> 12.0
@@ -170,7 +181,6 @@ class SteveMinionController(
 
                 eq.setItemInMainHand(mainWeapon)
                 eq.setItemInOffHand(ItemStack(Material.SHIELD))
-                EquipmentSlot.entries.forEach { eq.setDropChance(it, 0f) }
             }
             return SteveMinionController(mannequin, isArcher, phaseTier)
         }

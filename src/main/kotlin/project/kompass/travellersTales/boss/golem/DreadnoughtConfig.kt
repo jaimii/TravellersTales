@@ -30,16 +30,31 @@ data class DreadnoughtConfig(
     val smashGrabRangeSquared: Double = smashGrabRange * smashGrabRange
 
     companion object {
+        private const val DEFAULT_SMALL_CAPS_NAME = "<bold><gold>ᴅʀᴇᴀᴅɴᴏᴜɢʜᴛ</gold> <green>ɢᴏʟᴇᴍ</green></bold>"
+        private const val LEGACY_PLAIN_NAME = "<bold><gold>Dreadnought</gold> <green>Golem</green></bold>"
+
         fun load(config: FileConfiguration): DreadnoughtConfig {
             val sec = config.getConfigurationSection("dreadnought")
             val barSec = sec?.getConfigurationSection("boss-bar")
             val skillSec = sec?.getConfigurationSection("skills")
 
-            val name = sec?.getString("display-name") ?: "<bold><gold>Dreadnought</gold> <green>Golem</green></bold>"
+            val rawName = sec?.getString("display-name")
+            val name = if (rawName.isNullOrBlank() || rawName == LEGACY_PLAIN_NAME) {
+                DEFAULT_SMALL_CAPS_NAME
+            } else {
+                rawName
+            }
+
+            val rawBarTitle = barSec?.getString("title")
+            val barTitle = if (rawBarTitle.isNullOrBlank() || rawBarTitle == LEGACY_PLAIN_NAME) {
+                name
+            } else {
+                rawBarTitle
+            }
 
             val barSettings = BossBarSettings(
                 enabled = barSec?.getBoolean("enabled", true) ?: true,
-                title = barSec?.getString("title") ?: name,
+                title = barTitle,
                 color = BossBar.Color.GREEN,
                 overlay = BossBar.Overlay.PROGRESS,
                 flags = if (barSec?.getBoolean("darken-sky", false) == true) setOf(BossBar.Flag.DARKEN_SCREEN) else emptySet(),
@@ -58,7 +73,7 @@ data class DreadnoughtConfig(
                 knockbackResistance = (sec?.getDouble("knockback-resistance", 1.0) ?: 1.0).coerceIn(0.0, 1.0),
                 attackCadenceTicks = (sec?.getInt("attack-cadence-ticks", 12) ?: 12).coerceAtLeast(5),
                 bossBar = barSettings,
-                healAuraRadius = sec?.getDouble("heal-aura-radius", 16.0) ?: 16.0,
+                healAuraRadius = skillSec?.getDouble("heal-aura-radius", 16.0) ?: 16.0,
                 smashCooldownMillis = (skillSec?.getLong("smash-cooldown-seconds", 20L) ?: 20L) * 1000L,
                 smashGrabRange = skillSec?.getDouble("smash-grab-range", 40.0) ?: 40.0,
                 smashPrimaryDamage = skillSec?.getDouble("smash-primary-damage", 50.0) ?: 50.0,

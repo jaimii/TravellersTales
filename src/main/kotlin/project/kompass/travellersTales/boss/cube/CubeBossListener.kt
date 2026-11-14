@@ -3,8 +3,10 @@ package project.kompass.travellersTales.boss.cube
 import org.bukkit.*
 import org.bukkit.damage.DamageType
 import org.bukkit.entity.AbstractCubeMob
+import org.bukkit.entity.Entity
 import org.bukkit.entity.LivingEntity
 import org.bukkit.entity.Player
+import org.bukkit.entity.Projectile
 import org.bukkit.event.EventHandler
 import org.bukkit.event.EventPriority
 import org.bukkit.event.Listener
@@ -12,16 +14,76 @@ import org.bukkit.event.block.Action
 import org.bukkit.event.entity.EntityDamageByEntityEvent
 import org.bukkit.event.entity.EntityDamageEvent
 import org.bukkit.event.entity.EntityDeathEvent
+import org.bukkit.event.entity.PlayerDeathEvent
 import org.bukkit.event.entity.SlimeSplitEvent
 import org.bukkit.event.player.PlayerInteractEvent
 import org.bukkit.event.player.PlayerMoveEvent
+import org.bukkit.event.world.EntitiesLoadEvent
+import org.bukkit.persistence.PersistentDataType
 import project.kompass.travellersTales.TravellersTales
+import project.kompass.travellersTales.registry.MobKeys
 import project.kompass.travellersTales.util.mm
 
 class CubeBossListener(
     private val plugin: TravellersTales,
     private val manager: CubeBossManager
 ) : Listener {
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    fun onEntitiesLoad(event: EntitiesLoadEvent) {
+        for (entity in event.entities) {
+            if (entity is AbstractCubeMob && manager.isCubeBossEntity(entity)) {
+                manager.rebindOrRestoreCube(entity)
+            }
+        }
+    }
+
+    /**
+     * Universal 3-Day Deferral Hook:
+     * If ANY boss (or boss minion/projectile) kills a player, defer Giant & Traveller spawns for 3 days.
+     */
+    @EventHandler(priority = EventPriority.MONITOR)
+    fun onPlayerKilledByAnyBoss(event: PlayerDeathEvent) {
+        val player = event.player
+        val lastByEntity = player.lastDamageCause as? EntityDamageByEntityEvent
+        val damager: Entity? = when (val raw = lastByEntity?.damager) {
+            is Projectile -> (raw.shooter as? Entity) ?: raw
+            else -> raw
+        }
+
+        val killedByBossOrMinion = (damager != null && isBossOrMinionEntity(damager)) ||
+                player.location.getNearbyLivingEntities(48.0).any { isBossOrMinionEntity(it) }
+
+        if (killedByBossOrMinion) {
+            plugin.travellerManager.deferNaturalBossesForThreeDays(player)
+        }
+    }
+
+    /**
+     * Universal 3-Day Deferral Hook:
+     * If ANY boss is killed by a player, defer Giant & Traveller spawns for 3 days for all participants.
+     */
+    @EventHandler(priority = EventPriority.MONITOR)
+    fun onAnyBossKilledDeferNightBosses(event: EntityDeathEvent) {
+        val entity = event.entity
+        if (!entity.persistentDataContainer.has(MobKeys.MOB_ID, PersistentDataType.STRING)) return
+
+        val participants = HashSet<Player>()
+        entity.killer?.let { participants.add(it) }
+        participants.addAll(entity.location.getNearbyPlayers(64.0))
+        participants.forEach { plugin.travellerManager.deferNaturalBossesForThreeDays(it) }
+    }
+
+    private fun isBossOrMinionEntity(entity: Entity): Boolean {
+        val pdc = entity.persistentDataContainer
+        return pdc.has(MobKeys.MOB_ID, PersistentDataType.STRING) ||
+                pdc.has(MobKeys.WITHER_MINION, PersistentDataType.BYTE) ||
+                pdc.has(MobKeys.WITHER_ARCHER, PersistentDataType.BYTE) ||
+                pdc.has(MobKeys.WARDEN_PARASITE, PersistentDataType.BYTE) ||
+                pdc.has(MobKeys.GIANT_MINION, PersistentDataType.BYTE) ||
+                pdc.has(MobKeys.CUBE_BOSS_MINION, PersistentDataType.BYTE) ||
+                pdc.has(MobKeys.HEROBRINE_MINION, PersistentDataType.BYTE)
+    }
 
     // ========================================================================
     // 1. CUSTOM SPAWN EGG SUMMONING
@@ -113,7 +175,6 @@ class CubeBossListener(
         }
 
         if (bootsType == CubeBossType.MAGMA_CORE.bootsId) {
-            // Modern DamageType check replaces deprecated DamageCause.HOT_FLOOR
             if (dmgType == DamageType.HOT_FLOOR ||
                 dmgType == DamageType.IN_FIRE ||
                 dmgType == DamageType.ON_FIRE ||
@@ -141,7 +202,6 @@ class CubeBossListener(
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     fun onPlayerMoveWithMagmaBoots(event: PlayerMoveEvent) {
-        // Fast-Exit: Only evaluate blocks if the player has stepped across a full block boundary
         val from = event.from
         val to = event.to
         if (from.blockX == to.blockX && from.blockY == to.blockY && from.blockZ == to.blockZ) {

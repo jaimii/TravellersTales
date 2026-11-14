@@ -11,15 +11,28 @@ import org.bukkit.event.EventPriority
 import org.bukkit.event.Listener
 import org.bukkit.event.entity.CreatureSpawnEvent
 import org.bukkit.event.entity.EntityDamageByEntityEvent
+import org.bukkit.event.entity.EntityDamageEvent
 import org.bukkit.event.entity.EntityDeathEvent
+import org.bukkit.event.world.EntitiesLoadEvent
 import org.bukkit.persistence.PersistentDataType
 import project.kompass.travellersTales.TravellersTales
 import project.kompass.travellersTales.registry.MobKeys
+import project.kompass.travellersTales.util.BossKillTracker
 
 class WitherListener(
     private val plugin: TravellersTales,
     private val manager: WitherManager
 ) : Listener {
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    fun onEntitiesLoad(event: EntitiesLoadEvent) {
+        val fight = manager.activeFight ?: return
+        for (entity in event.entities) {
+            if (entity is Wither && entity.uniqueId == fight.witherId) {
+                fight.rebindWither(entity)
+            }
+        }
+    }
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     fun onWitherSpawn(event: CreatureSpawnEvent) {
@@ -34,9 +47,37 @@ class WitherListener(
     }
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
-    fun onWitherDamaged(event: EntityDamageByEntityEvent) {
+    fun onWitherGeneralDamage(event: EntityDamageEvent) {
         val fight = manager.activeFight ?: return
-        if (event.entity != fight.wither) return
+        if (event.entity.uniqueId != fight.witherId) return
+        (event.entity as? Wither)?.let { fight.rebindWither(it) }
+
+        if (fight.inIntro || fight.inMidpoint) {
+            event.isCancelled = true
+            return
+        }
+
+        val byEntity = event as? EntityDamageByEntityEvent
+        if (byEntity != null) {
+            val damager = byEntity.damager
+            if (damager.uniqueId == fight.witherId ||
+                (damager is Projectile && (damager.shooter as? org.bukkit.entity.Entity)?.uniqueId == fight.witherId)
+            ) {
+                event.isCancelled = true
+                return
+            }
+        }
+
+        val cap = fight.config.maxSingleHitDamage
+        if (event.damage > cap) {
+            event.damage = cap
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    fun onWitherDamagedByEntity(event: EntityDamageByEntityEvent) {
+        val fight = manager.activeFight ?: return
+        if (event.entity.uniqueId != fight.witherId) return
 
         val damager = event.damager
         val attackingPlayer: Player? = when (damager) {
@@ -45,18 +86,13 @@ class WitherListener(
             else -> null
         }
 
-        // 1. Phase 1 Direct Non-Projectile Hit Counter
         if (damager is Player && !fight.inPhase2) {
             fight.triggerPhase1DirectHitCounter()
         }
 
-        // 2. Burst Damage Counter & Phase Transitions
         if (attackingPlayer != null) {
-            val healthBefore = fight.wither.health
             Bukkit.getScheduler().runTask(plugin, Runnable {
                 if (!fight.wither.isValid || fight.wither.isDead) return@Runnable
-                val healthLost = (healthBefore - fight.wither.health).coerceAtLeast(0.0)
-                fight.handleBurstDamageCheck(healthLost)
                 fight.checkPhaseTransitions()
             })
         }
@@ -67,7 +103,6 @@ class WitherListener(
         val entity = event.entity
         val pdc = entity.persistentDataContainer
 
-        // Empty loot table for all Wither minions
         if (pdc.has(MobKeys.WITHER_MINION, PersistentDataType.BYTE) ||
             pdc.has(MobKeys.WITHER_ARCHER, PersistentDataType.BYTE)
         ) {
@@ -77,10 +112,9 @@ class WitherListener(
 
         val fight = manager.activeFight ?: return
 
-        // Killing a Wither Skeleton minion deals 10 arrow damage to the Wither
         if (pdc.has(MobKeys.WITHER_MINION, PersistentDataType.BYTE)) {
             val killer = entity.killer
-            if (killer != null && fight.wither.isValid && !fight.wither.isDead) {
+            if (killer != null && fight.wither.isValid && !fight.wither.isDead && !fight.inIntro && !fight.inMidpoint) {
                 val arrowSource = DamageSource.builder(DamageType.ARROW)
                     .withCausingEntity(killer)
                     .withDirectEntity(killer)
@@ -91,9 +125,14 @@ class WitherListener(
             return
         }
 
-        // Wither Boss Death
-        if (entity == fight.wither) {
+        if (entity.uniqueId == fight.witherId) {
             event.droppedExp = 0
+
+            val participants = HashSet<Player>()
+            entity.killer?.let { participants.add(it) }
+            participants.addAll(entity.location.getNearbyPlayers(64.0))
+            participants.forEach { BossKillTracker.recordBossKill(it, "the_wither") }
+
             fight.onDeath(entity.location)
             manager.clearActiveFight(fight)
         }

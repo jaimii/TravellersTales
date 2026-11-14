@@ -6,6 +6,8 @@ import net.kyori.adventure.text.format.NamedTextColor
 import org.bukkit.*
 import org.bukkit.attribute.Attribute
 import org.bukkit.attribute.AttributeModifier
+import org.bukkit.damage.DamageSource
+import org.bukkit.damage.DamageType
 import org.bukkit.entity.*
 import org.bukkit.event.entity.CreatureSpawnEvent
 import org.bukkit.inventory.ItemStack
@@ -23,41 +25,46 @@ import project.kompass.travellersTales.TravellersTales
 import project.kompass.travellersTales.registry.MobKeys
 import project.kompass.travellersTales.util.ExperienceUtil
 import project.kompass.travellersTales.util.mm
+import java.util.UUID
 import kotlin.math.cos
 import kotlin.math.sin
 
 class ActiveWitherFight(
     private val plugin: TravellersTales,
-    val wither: Wither,
+    var wither: Wither,
     var config: WitherConfig
 ) {
-    val world: World = wither.world
+    val witherId: UUID = wither.uniqueId
+    val world: World
+        get() = wither.world
+
     private val tasks = mutableListOf<BukkitTask>()
     private val spawnOrigin: Location = wither.location.clone()
 
     private val wasAdvanceTime: Boolean = world.getGameRuleValue(GameRules.ADVANCE_TIME)
     private val wasMobGriefing: Boolean = world.getGameRuleValue(GameRules.MOB_GRIEFING)
 
-    var inPhase2 = false
+    var inIntro: Boolean = true
         private set
-    var chargePrepReady = false
-    var chargeUnlocked = false
+    var inMidpoint: Boolean = false
         private set
-    var swarmTriggered = false
+    var inPhase2: Boolean = false
         private set
-    var dashUnlocked = false
+    var chargePrepReady: Boolean = false
+    var chargeUnlocked: Boolean = false
         private set
-    var isEnraged = false
+    var swarmTriggered: Boolean = false
         private set
-    var highDpsTriggered = false
+    var dashUnlocked: Boolean = false
         private set
-    var bedrockDeathTriggered = false
+    var isEnraged: Boolean = false
+        private set
+    var bedrockDeathTriggered: Boolean = false
         private set
 
-    private var inIntro = true
-    private var inMidpoint = false
-    private var isCharging = false
-    private var chargeChainCount = 0
+    private var isCharging: Boolean = false
+    private var chargeChainCount: Int = 0
+    private var lastDirectHitCounterMillis: Long = 0L
     private var homingStand: ArmorStand? = null
     private var witherTeam: Team? = null
 
@@ -67,6 +74,36 @@ class ActiveWitherFight(
         plugin.bossBarManager.createBossBar(wither, config.bossBar)
         applyEnvironmentAndIntro()
         scheduleCoreLoops()
+    }
+
+    /**
+     * Re-binds the live Wither reference when its chunk reloads so its BossBar and AI stay active.
+     */
+    fun rebindWither(loaded: Wither) {
+        val wasUnloaded = !this.wither.isValid
+        this.wither = loaded
+        witherTeam?.addEntity(loaded)
+        plugin.bossBarManager.rebindEntity(loaded)
+
+        // If the chunk unloaded mid-charge or mid-slam, restore AI & vulnerability immediately
+        if (wasUnloaded && !loaded.isDead && !inIntro) {
+            inMidpoint = false
+            isCharging = false
+            loaded.setInvulnerable(false)
+            loaded.invulnerableTicks = 0
+            loaded.setAI(true)
+            loaded.setGravity(true)
+        }
+    }
+
+    private fun ensureLiveWither(): Boolean {
+        if (wither.isValid) return true
+        val live = Bukkit.getEntity(witherId) as? Wither
+        if (live != null && live.isValid) {
+            rebindWither(live)
+            return true
+        }
+        return false
     }
 
     private fun setupTeam() {
@@ -82,6 +119,8 @@ class ActiveWitherFight(
     private fun configureWitherEntity() {
         wither.persistentDataContainer.set(MobKeys.MOB_ID, PersistentDataType.STRING, "the_wither")
         wither.customName("<bold><dark_purple>The Wither</dark_purple></bold>".mm())
+        wither.isPersistent = true
+        wither.removeWhenFarAway = false
         wither.invulnerableTicks = 220
 
         wither.getAttribute(Attribute.MAX_HEALTH)?.baseValue = config.maxHealth
@@ -97,6 +136,10 @@ class ActiveWitherFight(
 
         WitherMinionFactory.equipWitherBlastArmor(wither)
     }
+
+    // ========================================================================
+    // SPAWN INTRO SEQUENCE
+    // ========================================================================
 
     private fun applyEnvironmentAndIntro() {
         if (config.weatherEffects) {
@@ -129,12 +172,12 @@ class ActiveWitherFight(
             p.stopSound(org.bukkit.SoundCategory.MUSIC)
             p.playSound(wither.location, "minecraft:wither.10sec", SoundCategory.RECORDS, 1f, 1f)
             p.playSound(wither.location, org.bukkit.Sound.MUSIC_NETHER_BASALT_DELTAS, SoundCategory.MUSIC, 2f, 1f)
-            p.playSound(p.location, org.bukkit.Sound.ENTITY_PARROT_IMITATE_WITHER, SoundCategory.HOSTILE, 2f, 0.1f)
+            p.playSound(p.location, org.bukkit.Sound.ENTITY_PARROT_IMITATE_WITHER, SoundCategory.HOSTILE, 2f, 0.5f)
         }
 
         if (config.animationMode == AnimationMode.DEFAULT) {
             wither.addPotionEffect(PotionEffect(PotionEffectType.LEVITATION, 140, 3, false, false))
-            wither.addPotionEffect(PotionEffect(PotionEffectType.SLOW_FALLING, 400, 20, false, false))
+            wither.addPotionEffect(PotionEffect(PotionEffectType.SLOW_FALLING, 215, 20, false, false))
             world.spawnParticle(Particle.SCULK_SOUL, wither.location.add(0.0, 1.0, 0.0), 50, 0.5, 0.35, 0.5, 0.1)
             world.spawnParticle(Particle.SCULK_SOUL, wither.location, 1000, 15.0, 0.0, 15.0, 1e-20)
             world.spawnParticle(
@@ -150,7 +193,7 @@ class ActiveWitherFight(
             }
 
             val soulTask = runTimer(1L, 1L) {
-                if (!inIntro || !wither.isValid) return@runTimer
+                if (!inIntro || !ensureLiveWither()) return@runTimer
                 val targetLoc = wither.location.add(0.0, 1.0, 0.0)
                 val trailData = Particle.Trail(targetLoc, Color.fromRGB(5, 4, 3), 30)
                 wither.location.getNearbyEntities(50.0, 50.0, 50.0)
@@ -165,14 +208,14 @@ class ActiveWitherFight(
             }
         } else if (config.animationMode == AnimationMode.BEDROCK) {
             val spinTask = runTimer(1L, 1L) {
-                if (!inIntro || !wither.isValid) return@runTimer
+                if (!inIntro || !ensureLiveWither()) return@runTimer
                 wither.setRotation(wither.yaw + 20f, wither.pitch)
             }
             runLater(219L) { spinTask.cancel() }
         }
 
         val introPulse = runTimer(1L, 20L) {
-            if (!inIntro || !wither.isValid) return@runTimer
+            if (!inIntro || !ensureLiveWither()) return@runTimer
             if (config.animationMode == AnimationMode.DEFAULT) {
                 world.spawnParticle(
                     Particle.DUST_COLOR_TRANSITION,
@@ -190,9 +233,13 @@ class ActiveWitherFight(
             inIntro = false
             introPulse.cancel()
             clearAllGravityPulls()
-            if (!wither.isValid) return@runLater
+            if (!ensureLiveWither()) return@runLater
 
+            wither.invulnerableTicks = 0
+            wither.isInvulnerable = false
+            wither.removePotionEffect(PotionEffectType.SLOW_FALLING)
             wither.getAttribute(Attribute.FLYING_SPEED)?.baseValue = 1.0
+
             if (config.animationMode == AnimationMode.DEFAULT) {
                 world.createExplosion(wither.location, 13f, false, config.destruction, wither)
                 world.spawnParticle(Particle.EXPLOSION_EMITTER, wither.location, 6, 0.0, 1.0, 0.0, 0.6, null, true)
@@ -203,7 +250,7 @@ class ActiveWitherFight(
             }
 
             runTimer(1L, 2780L) {
-                if (inPhase2 || !wither.isValid) return@runTimer
+                if (inPhase2 || !ensureLiveWither()) return@runTimer
                 wither.location.getNearbyPlayers(200.0).forEach { p ->
                     p.playSound(p.location, "minecraft:wither.phase1", SoundCategory.RECORDS, 1f, 1f)
                 }
@@ -211,31 +258,33 @@ class ActiveWitherFight(
         }
     }
 
+    // ========================================================================
+    // CORE LOOPS
+    // ========================================================================
+
     private fun scheduleCoreLoops() {
         runTimer(1L, 1L) {
-            if (!wither.isValid || wither.isDead) return@runTimer
+            if (!ensureLiveWither() || wither.isDead) return@runTimer
 
-            if (!highDpsTriggered) {
-                if (inPhase2 && wither.health >= config.midpointThreshold) {
-                    wither.health = (config.midpointThreshold - 2.0).coerceAtLeast(1.0)
-                }
-                if (dashUnlocked && wither.health >= config.enragedThreshold) {
-                    wither.health = (config.enragedThreshold - 2.0).coerceAtLeast(1.0)
-                }
+            if (inPhase2 && wither.health >= config.midpointThreshold) {
+                wither.health = (config.midpointThreshold - 2.0).coerceAtLeast(1.0)
+            }
+            if (dashUnlocked && wither.health >= config.enragedThreshold) {
+                wither.health = (config.enragedThreshold - 2.0).coerceAtLeast(1.0)
             }
 
             if (config.animationMode == AnimationMode.DEFAULT && !inIntro) {
-                tickSkullImpactBuffs()
+                tickSkullImpactExplosions()
             }
         }
 
         if (config.animationMode == AnimationMode.DEFAULT) {
             runTimer(240L, 2L) {
-                if (inPhase2 || !wither.isValid || inMidpoint) return@runTimer
+                if (inPhase2 || !ensureLiveWither() || inMidpoint || inIntro) return@runTimer
                 if (wither.health > config.midpointThreshold) {
-                    val nearestPlayer = wither.location.getNearbyPlayers(10.0).minByOrNull {
-                        it.location.distanceSquared(wither.location)
-                    }
+                    val nearestPlayer = wither.location.getNearbyPlayers(10.0)
+                        .filter { !it.isDead && (it.gameMode == GameMode.SURVIVAL || it.gameMode == GameMode.ADVENTURE) }
+                        .minByOrNull { it.location.distanceSquared(wither.location) }
                     if (nearestPlayer != null) {
                         shiftAwayFrom(nearestPlayer)
                     }
@@ -245,8 +294,10 @@ class ActiveWitherFight(
 
         // 5-Tick Loop: MaxCombatDistance (256.0) check, Aura particles, Iron Golem debuff, Blaze archer dismount
         runTimer(5L, 5L) {
-            if (!wither.isValid) return@runTimer
-            if (wither.location.distanceSquared(spawnOrigin) > config.maxCombatDistanceSquared) {
+            if (!ensureLiveWither()) return@runTimer
+            if (wither.world == spawnOrigin.world &&
+                wither.location.distanceSquared(spawnOrigin) > config.maxCombatDistanceSquared
+            ) {
                 wither.teleport(spawnOrigin)
             }
 
@@ -258,13 +309,13 @@ class ActiveWitherFight(
             }
 
             wLoc.getNearbyEntities(config.followRange, config.followRange, config.followRange).forEach { ent ->
-                if (ent is LivingEntity && ent !is Player && ent !is IronGolem && ent !is Villager) {
+                val pdc = ent.persistentDataContainer
+                if (pdc.has(MobKeys.WITHER_MINION, PersistentDataType.BYTE)) {
                     witherTeam?.addEntity(ent)
-                }
-                if (ent.persistentDataContainer.has(MobKeys.WITHER_MINION, PersistentDataType.BYTE)) {
                     world.spawnParticle(Particle.SOUL_FIRE_FLAME, ent.location, 10, 0.0, 0.0, 0.0, 0.03, null, true)
                 }
-                if (ent is Blaze && ent.persistentDataContainer.has(MobKeys.WITHER_ARCHER, PersistentDataType.BYTE)) {
+                if (ent is Blaze && pdc.has(MobKeys.WITHER_ARCHER, PersistentDataType.BYTE)) {
+                    witherTeam?.addEntity(ent)
                     if (inMidpoint) {
                         world.spawnParticle(Particle.SMOKE, ent.location, 1, 0.0, 0.0, 0.0, 0.0)
                         world.spawnParticle(Particle.LAVA, ent.location.add(0.0, -1.0, 0.0), 4, 0.2, 0.2, 0.2, 0.003)
@@ -273,7 +324,7 @@ class ActiveWitherFight(
                         ent.passengers.toList().forEach { ent.removePassenger(it) }
                     }
                 }
-                if (ent is IronGolem && ent.customName() == null && ent.location.distanceSquared(wLoc) <= 400.0) {
+                if (ent is IronGolem && !pdc.has(MobKeys.MOB_ID, PersistentDataType.STRING) && ent.location.distanceSquared(wLoc) <= 400.0) {
                     ent.addPotionEffect(PotionEffect(PotionEffectType.WITHER, 80, 3, false, true))
                     ent.addPotionEffect(PotionEffect(PotionEffectType.WEAKNESS, 80, 1, false, false))
                 }
@@ -281,12 +332,12 @@ class ActiveWitherFight(
         }
 
         runTimer(40L, 40L) {
-            if (!wither.isValid) return@runTimer
+            if (!ensureLiveWither()) return@runTimer
             convertNearbyUndead()
         }
 
         runTimer(300L, 40L) {
-            if (!wither.isValid || inMidpoint || isCharging) return@runTimer
+            if (!ensureLiveWither() || inMidpoint || isCharging) return@runTimer
             unstuckCheck()
         }
 
@@ -299,7 +350,7 @@ class ActiveWitherFight(
         }
 
         runTimer(440L, 160L) {
-            if (!wither.isValid || isEnraged || inMidpoint) return@runTimer
+            if (!ensureLiveWither() || isEnraged || inMidpoint || inIntro) return@runTimer
             launchAimedSkull(dangerous = true, customName = "Wither Missile", forwardOffset = 0.0)
         }
 
@@ -346,73 +397,21 @@ class ActiveWitherFight(
         }
     }
 
-    fun handleBurstDamageCheck(damageDealt: Double) {
-        if (!highDpsTriggered && damageDealt >= config.burstEnrageDamage) {
-            highDpsTriggered = true
-            Bukkit.broadcast("<bold><dark_red>The Wither is enraged!</dark_red></bold>".mm())
-
-            wither.health = (wither.health + 132.0).coerceAtMost(config.maxHealth)
-            wither.addPotionEffect(PotionEffect(PotionEffectType.RESISTANCE, 2000, 67, false, false))
-            world.playSound(wither.location, org.bukkit.Sound.ENTITY_WITHER_SPAWN, SoundCategory.MASTER, 10f, 0.5f)
-            world.playSound(wither.location, org.bukkit.Sound.ITEM_GOAT_HORN_SOUND_0, SoundCategory.MASTER, 10f, 0.5f)
-            world.spawnParticle(Particle.ANGRY_VILLAGER, wither.location, 100, 3.0, 3.0, 3.0, 1.0)
-
-            chargePrepReady = true
-            if (!chargeUnlocked && config.chargeAttack) {
-                chargeUnlocked = true
-                startChargeSequence()
-            }
-            if (!isEnraged) {
-                if (config.animationMode == AnimationMode.DEFAULT) {
-                    triggerEnraged()
-                } else {
-                    isEnraged = true
-                    plugin.bossBarManager.updateBarAppearance(
-                        wither,
-                        titleMiniMessage = config.bossBar.enragedTitle,
-                        color = config.bossBar.enragedColor
-                    )
-                }
-            }
-            if (!dashUnlocked && config.windDashes) {
-                dashUnlocked = true
-                startWindDashLoop()
-            }
-            if (!swarmTriggered && config.animationMode == AnimationMode.DEFAULT) {
-                swarmTriggered = true
-                triggerSwarm()
-            }
-        } else if (damageDealt >= config.burstTier2Damage) {
-            wither.health = (wither.health + 100.0).coerceAtMost(config.maxHealth)
-            wither.addPotionEffect(PotionEffect(PotionEffectType.RESISTANCE, 200, 67, false, false))
-            world.playSound(wither.location, org.bukkit.Sound.BLOCK_ANVIL_LAND, SoundCategory.MASTER, 5f, 0.1f)
-            world.playSound(wither.location, org.bukkit.Sound.ENTITY_PLAYER_ATTACK_CRIT, SoundCategory.MASTER, 5f, 0.5f)
-            world.spawnParticle(Particle.CAMPFIRE_COSY_SMOKE, wither.location, 300, 2.0, 2.0, 2.0, 0.1)
-            world.spawnParticle(Particle.LAVA, wither.location, 100, 2.0, 3.0, 2.0, 0.5)
-            world.createExplosion(wither.location, 15f, false, config.destruction, wither)
-        } else if (damageDealt >= config.burstTier1Damage) {
-            wither.health = (wither.health + 25.0).coerceAtMost(config.maxHealth)
-            wither.addPotionEffect(PotionEffect(PotionEffectType.RESISTANCE, 40, 50, false, false))
-            world.playSound(wither.location, org.bukkit.Sound.ITEM_FIRECHARGE_USE, SoundCategory.MASTER, 2f, 0.8f)
-            world.playSound(wither.location, org.bukkit.Sound.ENTITY_BLAZE_SHOOT, SoundCategory.MASTER, 2f, 1.2f)
-            world.spawnParticle(Particle.FLAME, wither.location, 50, 0.5, 1.0, 0.5, 0.1)
-            world.spawnParticle(Particle.CRIT, wither.location, 50, 0.5, 1.0, 0.5, 0.5)
-            world.createExplosion(wither.location, 6f, false, config.destruction, wither)
-        }
-    }
-
     fun triggerPhase1DirectHitCounter() {
-        if (!config.directHitCounter || inPhase2) return
+        if (!config.directHitCounter || inPhase2 || inIntro || inMidpoint) return
         if (wither.health <= config.midpointThreshold) return
 
-        wither.addPotionEffect(PotionEffect(PotionEffectType.RESISTANCE, 3, 20, false, false))
+        val now = System.currentTimeMillis()
+        if (now - lastDirectHitCounterMillis < 1200L) return
+        lastDirectHitCounterMillis = now
+
         world.createExplosion(wither.location.add(0.0, -1.0, 0.0), 4f, false, config.destruction, wither)
 
         val hasBedrockAbove = (1..7).any {
             wither.location.clone().add(0.0, it.toDouble(), 0.0).block.type == Material.BEDROCK
         }
         if (!hasBedrockAbove) {
-            wither.velocity = Vector(0.0, 8.0, 0.0)
+            wither.velocity = Vector(0.0, 4.5, 0.0)
         }
     }
 
@@ -422,10 +421,14 @@ class ActiveWitherFight(
         faceEntity(wither, player.eyeLocation)
     }
 
+    // ========================================================================
+    // HOMING SKULL
+    // ========================================================================
+
     private fun scheduleNextHomingCheck(delayTicks: Long) {
         runLater(delayTicks) {
-            if (!wither.isValid) return@runLater
-            if (wither.health <= config.homingThreshold && (homingStand == null || !homingStand!!.isValid)) {
+            if (wither.isDead) return@runLater
+            if (ensureLiveWither() && wither.health <= config.homingThreshold && (homingStand == null || !homingStand!!.isValid)) {
                 spawnHomingSkull()
             }
             val nextDelay = if (isEnraged) 200L else 400L
@@ -442,10 +445,10 @@ class ActiveWitherFight(
         var task: BukkitTask? = null
         task = runTimer(1L, 1L) {
             ticksAlive++
-            val target = stand.location.getNearbyPlayers(config.followRange).minByOrNull {
-                it.location.distanceSquared(stand.location)
-            }
-            if (!stand.isValid || !wither.isValid || target == null || ticksAlive > 300) {
+            val target = stand.location.getNearbyPlayers(config.followRange)
+                .filter { !it.isDead && (it.gameMode == GameMode.SURVIVAL || it.gameMode == GameMode.ADVENTURE) }
+                .minByOrNull { it.location.distanceSquared(stand.location) }
+            if (!stand.isValid || !ensureLiveWither() || target == null || ticksAlive > 300) {
                 stand.remove()
                 task?.cancel()
                 return@runTimer
@@ -480,6 +483,10 @@ class ActiveWitherFight(
         }
     }
 
+    // ========================================================================
+    // MIDPOINT TRANSITION: BLAZE ARCHERS & GROUND SLAM
+    // ========================================================================
+
     private fun triggerMidpoint() {
         inPhase2 = true
         if (!isEnraged) {
@@ -501,14 +508,10 @@ class ActiveWitherFight(
             p.stopSound(Sound.sound(Key.key("minecraft:wither.phase1"), Sound.Source.RECORD, 1f, 1f))
         }
         runTimer(1L, 4660L) {
-            if (!wither.isValid) return@runTimer
+            if (!ensureLiveWither()) return@runTimer
             wither.location.getNearbyPlayers(200.0).forEach { p ->
                 p.playSound(p.location, "minecraft:wither.phase2", SoundCategory.RECORDS, 1f, 1f)
             }
-        }
-
-        wither.location.getNearbyEntitiesByType(WitherSkeleton::class.java, 20.0).forEach {
-            it.addPotionEffect(PotionEffect(PotionEffectType.RESISTANCE, 60, 10, false, false))
         }
 
         if (config.animationMode == AnimationMode.BEDROCK) {
@@ -531,8 +534,8 @@ class ActiveWitherFight(
         if (config.destruction) {
             breakBoxAround(wither.location, 1, 0..3, 1, dropItems = false)
         }
-        world.playSound(wither.location, org.bukkit.Sound.ENTITY_WITHER_BREAK_BLOCK, SoundCategory.BLOCKS, 0.5f, 0.1f)
-        world.playSound(wither.location, org.bukkit.Sound.ENTITY_WITHER_SKELETON_HURT, SoundCategory.HOSTILE, 0.5f, 0.1f)
+        world.playSound(wither.location, org.bukkit.Sound.ENTITY_WITHER_BREAK_BLOCK, SoundCategory.BLOCKS, 0.8f, 0.5f)
+        world.playSound(wither.location, org.bukkit.Sound.ENTITY_WITHER_SKELETON_HURT, SoundCategory.HOSTILE, 0.8f, 0.5f)
         world.playSound(wither.location, org.bukkit.Sound.ENTITY_WITHER_SPAWN, SoundCategory.HOSTILE, 2f, 0.8f)
 
         val playerCount = wither.location.getNearbyPlayers(100.0).size
@@ -545,7 +548,7 @@ class ActiveWitherFight(
         WitherTags.BLAZE_ARCHER_VECTORS.take(archerCount).forEachIndexed { index, vec ->
             val delay = 3L + (index * 36L / archerCount)
             runLater(delay) {
-                if (!wither.isValid) return@runLater
+                if (!ensureLiveWither()) return@runLater
                 WitherMinionFactory.spawnBlazeArcher(wither.location, vec, witherTeam)
                 world.playSound(wither.location, org.bukkit.Sound.ENTITY_FIREWORK_ROCKET_LAUNCH, SoundCategory.HOSTILE, 1f, 2f)
             }
@@ -555,7 +558,8 @@ class ActiveWitherFight(
         var slamPhase = false
         var midTask: BukkitTask? = null
         midTask = runTimer(1L, 1L) {
-            if (!wither.isValid) {
+            if (!ensureLiveWither()) {
+                inMidpoint = false
                 midTask?.cancel()
                 return@runTimer
             }
@@ -573,7 +577,7 @@ class ActiveWitherFight(
                     }
                 }
             } else {
-                if (wither.isOnGround || !wither.location.clone().add(0.0, -0.5, 0.0).block.type.isAir || midpointTicks > 100) {
+                if (wither.isOnGround || !wither.location.clone().add(0.0, -0.8, 0.0).block.type.isAir || midpointTicks > 100) {
                     midTask?.cancel()
                     onMidpointGroundSlam()
                 } else {
@@ -586,6 +590,7 @@ class ActiveWitherFight(
     private fun onMidpointGroundSlam() {
         inMidpoint = false
         wither.isInvulnerable = false
+        wither.invulnerableTicks = 0
         wither.setAI(true)
         wither.setGravity(true)
 
@@ -599,14 +604,14 @@ class ActiveWitherFight(
 
         shockwaveStages.forEachIndexed { idx, (spread, distRange, levAmp) ->
             runLater((idx + 1).toLong()) {
-                if (!wither.isValid) return@runLater
+                if (!ensureLiveWither()) return@runLater
                 val loc = wither.location
                 world.spawnParticle(Particle.DUST_PLUME, loc, (idx + 1) * 400, spread, 0.2, spread, 1e-7, null, true)
                 if (idx <= 2) {
                     world.spawnParticle(Particle.SOUL_FIRE_FLAME, loc, (idx + 1) * 200, spread, 0.2, spread, 1e-7, null, true)
                 }
                 if (idx == 0) {
-                    world.playSound(loc, org.bukkit.Sound.BLOCK_ANVIL_LAND, SoundCategory.BLOCKS, 1f, 0.2f)
+                    world.playSound(loc, org.bukkit.Sound.BLOCK_ANVIL_LAND, SoundCategory.BLOCKS, 1f, 0.5f)
                 } else {
                     world.playSound(loc, org.bukkit.Sound.BLOCK_STONE_BREAK, SoundCategory.BLOCKS, 1f, 0.5f)
                 }
@@ -621,11 +626,13 @@ class ActiveWitherFight(
         }
 
         runLater(10L) {
-            wither.location.getNearbyPlayers(30.0).forEach { it.removePotionEffect(PotionEffectType.LEVITATION) }
+            if (ensureLiveWither()) {
+                wither.location.getNearbyPlayers(30.0).forEach { it.removePotionEffect(PotionEffectType.LEVITATION) }
+            }
         }
 
         runLater(5L) {
-            if (!wither.isValid) return@runLater
+            if (!ensureLiveWither()) return@runLater
             world.createExplosion(wither.location.add(0.0, 1.0, 0.0), 10f, false, config.destruction, wither)
             world.strikeLightningEffect(wither.location)
             wither.getAttribute(Attribute.ARMOR)?.baseValue = 6.0
@@ -636,64 +643,87 @@ class ActiveWitherFight(
         }
     }
 
+    // ========================================================================
+    // CHARGE ATTACK & TRIPLE ENRAGED CHAIN CHARGES
+    // ========================================================================
+
     private fun startChargeSequence() {
-        if (!wither.isValid || inMidpoint) return
+        if (wither.isDead) return
+        if (!ensureLiveWither() || inMidpoint || inIntro) {
+            runLater(80L) { startChargeSequence() }
+            return
+        }
+
         isCharging = true
-        val startOrigin = wither.location.clone()
         wither.setAI(false)
         wither.isGlowing = true
 
-        val nearestPlayer = wither.location.getNearbyPlayers(config.followRange).minByOrNull {
-            it.location.distanceSquared(wither.location)
-        }
+        val nearestPlayer = wither.location.getNearbyPlayers(config.followRange)
+            .filter { !it.isDead && (it.gameMode == GameMode.SURVIVAL || it.gameMode == GameMode.ADVENTURE) }
+            .minByOrNull { it.location.distanceSquared(wither.location) }
         if (nearestPlayer != null) {
             faceEntity(wither, nearestPlayer.location)
         }
 
-        world.playSound(wither.location, org.bukkit.Sound.ENTITY_BREEZE_INHALE, SoundCategory.HOSTILE, 1f, 0.1f)
+        world.playSound(wither.location, org.bukkit.Sound.ENTITY_BREEZE_INHALE, SoundCategory.HOSTILE, 1.5f, 0.5f)
         world.playSound(wither.location, org.bukkit.Sound.ENTITY_WITHER_DEATH, SoundCategory.HOSTILE, 0.8f, 2f)
         wither.location.getNearbyPlayers(30.0).forEach { p ->
             p.playSound(p.location, org.bukkit.Sound.ENTITY_EXPERIENCE_ORB_PICKUP, SoundCategory.PLAYERS, 1f, 0.7f)
             p.playSound(p.location, org.bukkit.Sound.ENTITY_EXPERIENCE_ORB_PICKUP, SoundCategory.PLAYERS, 1f, 0.6f)
-            p.addPotionEffect(PotionEffect(PotionEffectType.RESISTANCE, 100, 0, false, false))
         }
-
-        val resistTicks = if (isEnraged) 180 else 60
-        wither.addPotionEffect(PotionEffect(PotionEffectType.RESISTANCE, resistTicks, 255, false, false))
 
         val windupTicks = if (isEnraged) 10L else 30L
         val chargeDurationTicks = if (isEnraged) 10 else 20
         val stepSpeed = if (isEnraged) 2.3 else 1.4
 
         runLater(windupTicks) {
-            if (!wither.isValid) return@runLater
-            val target = wither.location.getNearbyPlayers(config.followRange).minByOrNull {
-                it.location.distanceSquared(wither.location)
+            if (!ensureLiveWither()) {
+                isCharging = false
+                return@runLater
             }
+            val target = wither.location.getNearbyPlayers(config.followRange)
+                .filter { !it.isDead && (it.gameMode == GameMode.SURVIVAL || it.gameMode == GameMode.ADVENTURE) }
+                .minByOrNull { it.location.distanceSquared(wither.location) }
             if (target != null) {
                 faceEntity(wither, target.location)
             }
             val chargeDir = wither.location.direction.normalize()
+            val hitPlayers = HashSet<UUID>()
+            val chargeSource = DamageSource.builder(DamageType.MOB_ATTACK)
+                .withCausingEntity(wither)
+                .withDirectEntity(wither)
+                .build()
 
             var step = 0
             var chargeTask: BukkitTask? = null
             chargeTask = runTimer(1L, 1L) {
                 step++
-                if (!wither.isValid || step > chargeDurationTicks) {
+                if (!ensureLiveWither() || step > chargeDurationTicks) {
                     chargeTask?.cancel()
-                    finishCharge(startOrigin)
+                    finishCharge()
                     return@runTimer
                 }
 
                 val nextLoc = wither.location.clone().add(chargeDir.clone().multiply(stepSpeed))
-                if (nextLoc.block.type == Material.BEDROCK) {
+                val nextBlock = nextLoc.block
+                if (nextBlock.type == Material.BEDROCK || (!config.destruction && nextBlock.type.isSolid)) {
                     world.playSound(wither.location, org.bukkit.Sound.BLOCK_ANVIL_PLACE, SoundCategory.HOSTILE, 1f, 2f)
+                    chargeTask?.cancel()
+                    finishCharge()
+                    return@runTimer
                 } else {
                     wither.teleport(nextLoc)
-                    world.playSound(nextLoc, org.bukkit.Sound.ENTITY_WITHER_BREAK_BLOCK, SoundCategory.HOSTILE, 1f, 0.3f)
-                    if (config.destruction && !nextLoc.block.type.isAir) {
+                    world.playSound(nextLoc, org.bukkit.Sound.ENTITY_WITHER_BREAK_BLOCK, SoundCategory.HOSTILE, 1f, 0.5f)
+                    if (config.destruction && !nextBlock.type.isAir) {
                         world.createExplosion(nextLoc, 4f, false, true, wither)
                         breakBoxAround(nextLoc, 2, -2..2, 2, dropItems = true)
+                    }
+                }
+
+                wither.location.getNearbyPlayers(2.8).forEach { p ->
+                    if (!p.isDead && (p.gameMode == GameMode.SURVIVAL || p.gameMode == GameMode.ADVENTURE) && hitPlayers.add(p.uniqueId)) {
+                        p.damage(14.0, chargeSource)
+                        p.velocity = chargeDir.clone().setY(0.45).multiply(1.3)
                     }
                 }
 
@@ -713,13 +743,12 @@ class ActiveWitherFight(
         }
     }
 
-    private fun finishCharge(origin: Location) {
+    private fun finishCharge() {
         isCharging = false
-        if (!wither.isValid) return
-        wither.setAI(true)
-        wither.isGlowing = false
-        if (!config.destruction) {
-            wither.teleport(origin)
+        if (wither.isDead) return
+        if (ensureLiveWither()) {
+            wither.setAI(true)
+            wither.isGlowing = false
         }
 
         if (isEnraged) {
@@ -735,6 +764,10 @@ class ActiveWitherFight(
         }
     }
 
+    // ========================================================================
+    // 25% HP SWARM & ENRAGED 360° SKULL VOLLEY + WIND DASHES
+    // ========================================================================
+
     private fun triggerSwarm() {
         repeat(15) {
             WitherMinionFactory.spawnSwarmSkeleton(wither.location, witherTeam)
@@ -742,7 +775,7 @@ class ActiveWitherFight(
         listOf(1.5f, 1.6f, 1.4f, 1.8f, 1.3f).forEach { pitch ->
             world.playSound(wither.location, org.bukkit.Sound.ENTITY_SPIDER_STEP, SoundCategory.HOSTILE, 1f, pitch)
         }
-        world.playSound(wither.location, org.bukkit.Sound.ENTITY_WITHER_BREAK_BLOCK, SoundCategory.HOSTILE, 1f, 0.4f)
+        world.playSound(wither.location, org.bukkit.Sound.ENTITY_WITHER_BREAK_BLOCK, SoundCategory.HOSTILE, 1f, 0.5f)
         world.spawnParticle(Particle.SQUID_INK, wither.location.add(0.0, 1.0, 0.0), 100, 1.0, 0.5, 1.0, 5e-11)
     }
 
@@ -754,19 +787,19 @@ class ActiveWitherFight(
             color = config.bossBar.enragedColor
         )
 
-        wither.getAttribute(Attribute.GRAVITY)?.baseValue = 100.0
+        wither.getAttribute(Attribute.GRAVITY)?.baseValue = 1.5
         wither.getAttribute(Attribute.ARMOR)?.baseValue = 10.0
         wither.getAttribute(Attribute.ARMOR_TOUGHNESS)?.baseValue = 10.0
         witherTeam?.color(NamedTextColor.DARK_RED)
 
-        world.playSound(wither.location, org.bukkit.Sound.ENTITY_WITHER_DEATH, SoundCategory.HOSTILE, 1f, 0.3f)
+        world.playSound(wither.location, org.bukkit.Sound.ENTITY_WITHER_DEATH, SoundCategory.HOSTILE, 1f, 0.5f)
         world.playSound(wither.location, org.bukkit.Sound.ENTITY_WARDEN_SONIC_BOOM, SoundCategory.HOSTILE, 1f, 2f)
 
         spawn360SkullRing()
     }
 
     private fun spawn360SkullRing() {
-        if (!wither.isValid) return
+        if (!ensureLiveWither()) return
         val center = wither.location.add(0.0, 1.0, 0.0)
         val skulls = mutableListOf<WitherSkull>()
 
@@ -782,9 +815,9 @@ class ActiveWitherFight(
         }
 
         runLater(20L) {
-            val target = wither.location.getNearbyPlayers(config.followRange).minByOrNull {
-                it.location.distanceSquared(wither.location)
-            }
+            val target = wither.location.getNearbyPlayers(config.followRange)
+                .filter { !it.isDead && (it.gameMode == GameMode.SURVIVAL || it.gameMode == GameMode.ADVENTURE) }
+                .minByOrNull { it.location.distanceSquared(wither.location) }
             skulls.filter { it.isValid }.forEach { s ->
                 s.velocity = Vector(0.0, 0.0, 0.0)
                 s.setGravity(false)
@@ -793,24 +826,24 @@ class ActiveWitherFight(
                 if (target != null) faceEntity(s, target.eyeLocation)
             }
             target?.let {
-                it.playSound(it.location, org.bukkit.Sound.ITEM_FLINTANDSTEEL_USE, SoundCategory.HOSTILE, 0.8f, 0.1f)
+                it.playSound(it.location, org.bukkit.Sound.ITEM_FLINTANDSTEEL_USE, SoundCategory.HOSTILE, 0.8f, 0.5f)
                 it.playSound(it.location, org.bukkit.Sound.ITEM_FLINTANDSTEEL_USE, SoundCategory.HOSTILE, 0.8f, 0.7f)
             }
 
-            listOf(10L to 0.3f, 20L to 0.6f, 30L to 1.2f).forEach { (delay, pitch) ->
+            listOf(10L to 0.5f, 20L to 0.8f, 30L to 1.2f).forEach { (delay, pitch) ->
                 runLater(delay) {
-                    val p = wither.location.getNearbyPlayers(config.followRange).minByOrNull {
-                        it.location.distanceSquared(wither.location)
-                    } ?: return@runLater
+                    val p = wither.location.getNearbyPlayers(config.followRange)
+                        .filter { !it.isDead && (it.gameMode == GameMode.SURVIVAL || it.gameMode == GameMode.ADVENTURE) }
+                        .minByOrNull { it.location.distanceSquared(wither.location) } ?: return@runLater
                     p.playSound(p.location, org.bukkit.Sound.ENTITY_EXPERIENCE_ORB_PICKUP, SoundCategory.PLAYERS, 0.5f, pitch)
                     skulls.filter { it.isValid }.forEach { s -> faceEntity(s, p.eyeLocation) }
                 }
             }
 
             runLater(40L) {
-                val p = wither.location.getNearbyPlayers(config.followRange).minByOrNull {
-                    it.location.distanceSquared(wither.location)
-                }
+                val p = wither.location.getNearbyPlayers(config.followRange)
+                    .filter { !it.isDead && (it.gameMode == GameMode.SURVIVAL || it.gameMode == GameMode.ADVENTURE) }
+                    .minByOrNull { it.location.distanceSquared(wither.location) }
                 if (p != null) {
                     val eyeVec = p.eyeLocation.toVector()
                     skulls.filter { it.isValid }.forEach { s ->
@@ -825,7 +858,7 @@ class ActiveWitherFight(
                         world.createExplosion(s.location, 3f, false, config.destruction, wither)
                         s.remove()
                     }
-                    if (wither.isValid && isEnraged) {
+                    if (!wither.isDead && isEnraged) {
                         runLater(100L) { spawn360SkullRing() }
                     }
                 }
@@ -835,27 +868,32 @@ class ActiveWitherFight(
 
     private fun startWindDashLoop() {
         runTimer(1L, 60L) {
-            if (!wither.isValid || isCharging || inMidpoint) return@runTimer
-            val target = wither.location.getNearbyPlayers(config.followRange).minByOrNull {
-                it.location.distanceSquared(wither.location)
-            } ?: return@runTimer
+            if (!ensureLiveWither() || isCharging || inMidpoint || inIntro) return@runTimer
+            val target = wither.location.getNearbyPlayers(config.followRange)
+                .filter { !it.isDead && (it.gameMode == GameMode.SURVIVAL || it.gameMode == GameMode.ADVENTURE) }
+                .minByOrNull { it.location.distanceSquared(wither.location) } ?: return@runTimer
 
-            wither.setAI(false)
             faceEntity(wither, target.location)
-            val dashDir = wither.location.direction.normalize().multiply(1.8)
+            val flatDir = target.location.toVector().subtract(wither.location.toVector()).setY(0.0)
+            if (flatDir.lengthSquared() < 1e-4) return@runTimer
+            val dashDir = flatDir.normalize().multiply(1.8)
 
             var dashStep = 0
             var dashTask: BukkitTask? = null
             dashTask = runTimer(1L, 1L) {
                 dashStep++
-                if (!wither.isValid || dashStep > 5) {
-                    wither.setAI(true)
+                if (!ensureLiveWither() || isCharging || inMidpoint || dashStep > 5) {
                     dashTask?.cancel()
                     return@runTimer
                 }
-                wither.teleport(wither.location.add(dashDir))
+
+                val candidate = wither.location.clone().add(dashDir)
+                if (!candidate.block.type.isSolid) {
+                    wither.teleport(candidate)
+                }
+
                 world.spawnParticle(Particle.POOF, wither.location.add(0.0, 0.75, 0.0), 40, 0.8, 1.0, 0.8, 0.2)
-                world.playSound(wither.location, org.bukkit.Sound.ENTITY_BREEZE_WIND_BURST, SoundCategory.HOSTILE, 1f, 0.1f)
+                world.playSound(wither.location, org.bukkit.Sound.ENTITY_BREEZE_WIND_BURST, SoundCategory.HOSTILE, 1f, 0.5f)
                 world.spawn(wither.location, WindCharge::class.java, CreatureSpawnEvent.SpawnReason.CUSTOM) { wc ->
                     wc.shooter = wither
                     wc.velocity = Vector(0.0, -10.0, 0.0)
@@ -866,9 +904,9 @@ class ActiveWitherFight(
     }
 
     private fun launchAimedSkull(dangerous: Boolean, customName: String, forwardOffset: Double) {
-        val target = wither.location.getNearbyPlayers(config.followRange).minByOrNull {
-            it.location.distanceSquared(wither.location)
-        } ?: return
+        val target = wither.location.getNearbyPlayers(config.followRange)
+            .filter { !it.isDead && (it.gameMode == GameMode.SURVIVAL || it.gameMode == GameMode.ADVENTURE) }
+            .minByOrNull { it.location.distanceSquared(wither.location) } ?: return
 
         faceEntity(wither, target.eyeLocation)
         val spawnLoc = wither.location.clone().add(0.0, 3.0, 0.0)
@@ -886,11 +924,13 @@ class ActiveWitherFight(
 
     private fun scheduleNextBurstVolley(delayTicks: Long) {
         runLater(delayTicks) {
-            if (!wither.isValid) return@runLater
-            for (i in 0 until 5) {
-                runLater(i * 2L) {
-                    if (wither.isValid && !inMidpoint) {
-                        launchAimedSkull(dangerous = false, customName = "burst wither skulls", forwardOffset = 2.0)
+            if (wither.isDead) return@runLater
+            if (ensureLiveWither()) {
+                for (i in 0 until 5) {
+                    runLater(i * 2L) {
+                        if (ensureLiveWither() && !inMidpoint && !inIntro) {
+                            launchAimedSkull(dangerous = false, customName = "burst wither skulls", forwardOffset = 2.0)
+                        }
                     }
                 }
             }
@@ -899,7 +939,7 @@ class ActiveWitherFight(
         }
     }
 
-    private fun tickSkullImpactBuffs() {
+    private fun tickSkullImpactExplosions() {
         wither.location.getNearbyEntitiesByType(WitherSkull::class.java, config.followRange).forEach { skull ->
             if (skull.persistentDataContainer.has(MobKeys.WITHER_TEMP_ENTITY, PersistentDataType.BYTE)) return@forEach
             val dir = skull.velocity.clone()
@@ -907,12 +947,10 @@ class ActiveWitherFight(
             val aheadBlock = skull.location.add(dir.normalize()).block
             if (!aheadBlock.type.isAir && aheadBlock.type != Material.WATER) {
                 if (skull.isCharged) {
-                    wither.addPotionEffect(PotionEffect(PotionEffectType.RESISTANCE, 5, 3, false, false))
                     world.createExplosion(skull.location, 3f, false, config.destruction, wither)
                     world.spawnParticle(Particle.EXPLOSION, skull.location, 50, 1.5, 1.5, 1.5, 0.0)
                     world.spawnParticle(Particle.CAMPFIRE_SIGNAL_SMOKE, skull.location, 200, 1.0, 1.5, 1.0, 0.0)
                 } else {
-                    wither.addPotionEffect(PotionEffect(PotionEffectType.RESISTANCE, 5, 2, false, false))
                     world.createExplosion(skull.location, 2f, false, config.destruction, wither)
                     world.spawnParticle(Particle.SMOKE, skull.location, 200, 2.0, 2.0, 2.0, 0.01, null, true)
                 }
@@ -923,12 +961,14 @@ class ActiveWitherFight(
 
     private fun scheduleNextGuardSpawn(delayTicks: Long) {
         runLater(delayTicks) {
-            if (!wither.isValid) return@runLater
-            val hasNearbySkeleton = wither.location.getNearbyEntitiesByType(WitherSkeleton::class.java, 10.0).isNotEmpty()
-            if (!hasNearbySkeleton) {
-                WitherMinionFactory.spawnPeriodicGuard(wither.location, witherTeam)
-                world.spawnParticle(Particle.SQUID_INK, wither.location.add(0.0, -0.3, 0.0), 120, 0.0, 0.5, 0.0, 0.07, null, true)
-                world.spawnParticle(Particle.SMOKE, wither.location.add(0.0, -0.3, 0.0), 450, 1.0, 0.5, 1.0, 0.1, null, true)
+            if (wither.isDead) return@runLater
+            if (ensureLiveWither()) {
+                val hasNearbySkeleton = wither.location.getNearbyEntitiesByType(WitherSkeleton::class.java, 10.0).isNotEmpty()
+                if (!hasNearbySkeleton && !inIntro) {
+                    WitherMinionFactory.spawnPeriodicGuard(wither.location, witherTeam)
+                    world.spawnParticle(Particle.SQUID_INK, wither.location.add(0.0, -0.3, 0.0), 120, 0.0, 0.5, 0.0, 0.07, null, true)
+                    world.spawnParticle(Particle.SMOKE, wither.location.add(0.0, -0.3, 0.0), 450, 1.0, 0.5, 1.0, 0.1, null, true)
+                }
             }
             val nextDelay = if (isEnraged) 100L else 200L
             scheduleNextGuardSpawn(nextDelay)
@@ -938,8 +978,11 @@ class ActiveWitherFight(
     private fun convertNearbyUndead() {
         wither.location.getNearbyEntities(20.0, 20.0, 20.0).forEach { entity ->
             if (entity.customName() != null) return@forEach
-            if (entity.persistentDataContainer.has(MobKeys.WITHER_MINION, PersistentDataType.BYTE)) return@forEach
-            if (entity.persistentDataContainer.has(MobKeys.WITHER_ARCHER, PersistentDataType.BYTE)) return@forEach
+            val pdc = entity.persistentDataContainer
+            if (pdc.has(MobKeys.MOB_ID, PersistentDataType.STRING)) return@forEach
+            if (pdc.has(MobKeys.WITHER_MINION, PersistentDataType.BYTE)) return@forEach
+            if (pdc.has(MobKeys.WITHER_ARCHER, PersistentDataType.BYTE)) return@forEach
+            if (pdc.has(MobKeys.GIANT_MINION, PersistentDataType.BYTE)) return@forEach
 
             when (entity) {
                 is Zombie -> if (entity !is PigZombie) {
@@ -958,19 +1001,19 @@ class ActiveWitherFight(
 
     private fun unstuckCheck() {
         val loc = wither.location
-        if (loc.clone().add(0.0, -0.5, 0.0).block.type == Material.WATER ||
-            loc.clone().add(0.0, 0.5, 0.0).block.type == Material.WATER
+        if (!isEnraged && (loc.clone().add(0.0, -0.5, 0.0).block.type == Material.WATER ||
+                    loc.clone().add(0.0, 0.5, 0.0).block.type == Material.WATER)
         ) {
-            wither.velocity = Vector(0.0, 8.0, 0.0)
+            wither.velocity = Vector(0.0, 3.0, 0.0)
         }
 
         for (r in 1..3) {
             if (loc.clone().add(0.0, r.toDouble(), 0.0).block.type == Material.BEDROCK) {
-                wither.velocity = Vector(0.0, -8.0, 0.0)
+                wither.velocity = Vector(0.0, -3.0, 0.0)
                 break
             }
             if (loc.clone().add(0.0, -r.toDouble(), 0.0).block.type == Material.BEDROCK) {
-                wither.velocity = Vector(0.0, 8.0, 0.0)
+                wither.velocity = Vector(0.0, 3.0, 0.0)
                 break
             }
         }
@@ -989,9 +1032,13 @@ class ActiveWitherFight(
         }
     }
 
+    // ========================================================================
+    // DEATH SEQUENCE: ORBITING NETHER STAR RINGS, TROPHY & XP FOUNTAIN
+    // ========================================================================
+
     fun onDeath(deathLocation: Location) {
         cancelAllTasks()
-        plugin.bossBarManager.unregisterEntity(wither)
+        plugin.bossBarManager.unregisterById(witherId)
 
         Bukkit.getScheduler().runTaskLater(plugin, Runnable {
             val starItem = deathLocation.getNearbyEntitiesByType(Item::class.java, 12.0)
@@ -1043,9 +1090,9 @@ class ActiveWitherFight(
 
         world.spawnParticle(Particle.SOUL, starItem.location, 220, 0.0, 0.5, 0.0, 0.07)
         world.spawnParticle(Particle.SOUL, starItem.location.add(0.0, 1.0, 0.0), 80, 0.0, 1.0, 0.0, 0.04)
-        world.playSound(starItem.location, org.bukkit.Sound.PARTICLE_SOUL_ESCAPE, SoundCategory.MASTER, 100f, 0.1f)
+        world.playSound(starItem.location, org.bukkit.Sound.PARTICLE_SOUL_ESCAPE, SoundCategory.MASTER, 100f, 0.5f)
         world.playSound(starItem.location, org.bukkit.Sound.PARTICLE_SOUL_ESCAPE, SoundCategory.MASTER, 30f, 1f)
-        world.playSound(starItem.location, org.bukkit.Sound.ENTITY_LIGHTNING_BOLT_THUNDER, SoundCategory.AMBIENT, 1f, 0.3f)
+        world.playSound(starItem.location, org.bukkit.Sound.ENTITY_LIGHTNING_BOLT_THUNDER, SoundCategory.AMBIENT, 1f, 0.5f)
 
         var ticks = 0
         var starTask: BukkitTask? = null
@@ -1061,15 +1108,23 @@ class ActiveWitherFight(
                 sLoc.add(0.0, -0.005, 0.0)
             }
             sLoc.yaw += 10f
+            sLoc.pitch = 0f
             starItem.teleport(sLoc)
 
             val dLoc = sLoc.clone()
             dLoc.yaw = display.yaw + 4f
             display.teleport(dLoc)
 
-            world.spawnParticle(Particle.END_ROD, sLoc.clone().add(0.0, 0.3, 0.0), 2, 0.1, 0.1, 0.1, 0.0)
-            world.spawnParticle(Particle.ELECTRIC_SPARK, sLoc.clone().add(0.0, 0.8, 0.0), 2, 0.01, 0.0, 0.01, 1.0)
-            world.spawnParticle(Particle.END_ROD, sLoc.clone().add(0.0, 1.4, 0.0), 2, 0.1, 0.1, 0.1, 0.0)
+            val rad = Math.toRadians(sLoc.yaw.toDouble())
+            val forwardX = -sin(rad)
+            val forwardZ = cos(rad)
+
+            val lowerRingPt = sLoc.clone().add(forwardX * 1.25, 0.3, forwardZ * 1.25)
+            val upperRingPt = sLoc.clone().add(-forwardX * 0.85, 1.4, -forwardZ * 0.85)
+
+            world.spawnParticle(Particle.END_ROD, lowerRingPt, 2, 0.02, 0.02, 0.02, 0.0)
+            world.spawnParticle(Particle.ELECTRIC_SPARK, sLoc.clone().add(0.0, 0.8, 0.0), 2, 0.05, 0.05, 0.05, 0.2)
+            world.spawnParticle(Particle.END_ROD, upperRingPt, 2, 0.02, 0.02, 0.02, 0.0)
         }, 1L, 1L)
     }
 
@@ -1104,14 +1159,18 @@ class ActiveWitherFight(
 
     fun forceCleanup(killWither: Boolean) {
         cancelAllTasks()
-        plugin.bossBarManager.unregisterEntity(wither)
+        plugin.bossBarManager.unregisterById(witherId)
         restoreWorldState()
         purgeMinionsAndTempEntities()
         Bukkit.getOnlinePlayers().forEach { p ->
             p.stopSound(org.bukkit.SoundCategory.RECORDS)
         }
-        if (killWither && wither.isValid) {
-            wither.remove()
+        if (killWither) {
+            if (wither.isValid) {
+                wither.remove()
+            } else {
+                (Bukkit.getEntity(witherId) as? Wither)?.remove()
+            }
         }
     }
 

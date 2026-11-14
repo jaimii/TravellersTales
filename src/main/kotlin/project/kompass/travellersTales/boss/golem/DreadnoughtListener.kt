@@ -5,26 +5,40 @@ import org.bukkit.Particle
 import org.bukkit.Sound
 import org.bukkit.SoundCategory
 import org.bukkit.entity.AbstractArrow
+import org.bukkit.entity.Arrow
 import org.bukkit.entity.IronGolem
 import org.bukkit.entity.LivingEntity
 import org.bukkit.entity.Player
 import org.bukkit.entity.Projectile
+import org.bukkit.entity.SpectralArrow
+import org.bukkit.entity.Trident
 import org.bukkit.event.EventHandler
 import org.bukkit.event.EventPriority
 import org.bukkit.event.Listener
 import org.bukkit.event.block.BlockPlaceEvent
+import org.bukkit.event.entity.CreatureSpawnEvent
 import org.bukkit.event.entity.EntityDamageByEntityEvent
 import org.bukkit.event.entity.EntityDamageEvent
 import org.bukkit.event.entity.EntityDeathEvent
 import org.bukkit.event.entity.EntityTargetEvent
 import org.bukkit.event.entity.EntityTargetLivingEntityEvent
 import org.bukkit.event.entity.ProjectileHitEvent
+import org.bukkit.event.world.EntitiesLoadEvent
 import project.kompass.travellersTales.TravellersTales
 
 class DreadnoughtListener(
     private val plugin: TravellersTales,
     private val manager: DreadnoughtManager
 ) : Listener {
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    fun onEntitiesLoad(event: EntitiesLoadEvent) {
+        for (entity in event.entities) {
+            if (entity is IronGolem && manager.isDreadnoughtEntity(entity)) {
+                manager.rebindOrRestoreGolem(entity)
+            }
+        }
+    }
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     fun onStructureBlockPlace(event: BlockPlaceEvent) {
@@ -34,9 +48,6 @@ class DreadnoughtListener(
         })
     }
 
-    /**
-     * Ensures the Dreadnought Golem is strictly friendly to players, villagers, pets, and other golems.
-     */
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
     fun onDreadnoughtTargetLiving(event: EntityTargetLivingEntityEvent) {
         val fight = manager.getFight(event.entity) ?: return
@@ -59,17 +70,12 @@ class DreadnoughtListener(
         }
     }
 
-    /**
-     * Intercepts arrows hitting the Dreadnought Golem and reflects them back
-     * at the shooter with the exact same velocity magnitude.
-     */
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
     fun onArrowHitDreadnought(event: ProjectileHitEvent) {
         val hitEntity = event.hitEntity ?: return
         val fight = manager.getFight(hitEntity) ?: return
         val arrow = event.entity as? AbstractArrow ?: return
 
-        // Ignore arrows already reflected by the Golem itself
         if (arrow.shooter == fight.golem) return
 
         event.isCancelled = true
@@ -82,7 +88,6 @@ class DreadnoughtListener(
         val attackerFight = manager.getFight(event.damager)
         if (attackerFight != null) {
             val victim = event.entity as? LivingEntity ?: return
-            // Never allow the Golem to deal melee damage to a Player or friendly mob
             if (victim is Player || !attackerFight.isHostileEnemy(victim)) {
                 event.isCancelled = true
                 return
@@ -95,7 +100,6 @@ class DreadnoughtListener(
         val damagedFight = manager.getFight(event.entity) ?: return
         val damager = event.damager
 
-        // Immune to all arrow projectiles (safety net if EntityDamageByEntityEvent fires)
         if (damager is AbstractArrow) {
             event.isCancelled = true
             if (damager.shooter != damagedFight.golem) {
@@ -104,7 +108,6 @@ class DreadnoughtListener(
             return
         }
 
-        // If a player accidentally hits the Dreadnought Golem, ensure it never aggros onto the player
         val attackingPlayer: Player? = when (damager) {
             is Player -> damager
             is Projectile -> damager.shooter as? Player
@@ -119,55 +122,67 @@ class DreadnoughtListener(
         }
     }
 
-    /**
-     * Reflects [arrow] back toward its shooter at the exact same speed.
-     */
     private fun reflectArrowBack(golem: IronGolem, arrow: AbstractArrow) {
-        val incomingVelocity = arrow.velocity
-        val speed = incomingVelocity.length().coerceAtLeast(1.2)
-        val shooter = arrow.shooter as? LivingEntity
+        try {
+            val incomingVelocity = arrow.velocity
+            val speed = incomingVelocity.length().coerceAtLeast(1.2)
+            val shooter = arrow.shooter as? LivingEntity
 
-        // Aim back at the shooter's torso/eyes if valid, otherwise reverse the incoming vector
-        val reflectDir = if (shooter != null && shooter.isValid && shooter.world == golem.world) {
-            shooter.location.clone().add(0.0, shooter.height * 0.65, 0.0)
-                .toVector()
-                .subtract(arrow.location.toVector())
-                .normalize()
-        } else if (incomingVelocity.lengthSquared() > 1e-4) {
-            incomingVelocity.clone().multiply(-1.0).normalize()
-        } else {
-            golem.location.direction.normalize()
+            val reflectDir = if (shooter != null && shooter.isValid && shooter.world == golem.world) {
+                shooter.location.clone().add(0.0, shooter.height * 0.65, 0.0)
+                    .toVector()
+                    .subtract(arrow.location.toVector())
+                    .normalize()
+            } else if (incomingVelocity.lengthSquared() > 1e-4) {
+                incomingVelocity.clone().multiply(-1.0).normalize()
+            } else {
+                golem.location.direction.normalize()
+            }
+
+            val newVelocity = reflectDir.clone().multiply(speed)
+            val spawnLoc = arrow.location.clone().add(reflectDir.clone().multiply(0.9))
+            spawnLoc.direction = newVelocity
+
+            val world = golem.world
+            val spawned = world.spawnEntity(spawnLoc, arrow.type, CreatureSpawnEvent.SpawnReason.CUSTOM) as? AbstractArrow
+            if (spawned != null) {
+                spawned.shooter = golem
+                spawned.velocity = newVelocity
+                spawned.damage = arrow.damage
+                spawned.isCritical = arrow.isCritical
+                spawned.pierceLevel = arrow.pierceLevel
+                spawned.fireTicks = arrow.fireTicks
+                spawned.pickupStatus = AbstractArrow.PickupStatus.DISALLOWED
+
+                if (spawned is Arrow && arrow is Arrow) {
+                    arrow.basePotionType?.let { spawned.basePotionType = it }
+                    arrow.customEffects.forEach { effect ->
+                        spawned.addCustomEffect(effect, true)
+                    }
+                    arrow.color?.let { spawned.color = it }
+                } else if (spawned is SpectralArrow && arrow is SpectralArrow) {
+                    spawned.glowingTicks = arrow.glowingTicks
+                } else if (spawned is Trident && arrow is Trident) {
+                    spawned.itemStack = arrow.itemStack.clone()
+                }
+            }
+
+            world.playSound(arrow.location, Sound.ITEM_SHIELD_BLOCK, SoundCategory.NEUTRAL, 1.5f, 1.2f)
+            world.playSound(arrow.location, Sound.BLOCK_ANVIL_LAND, SoundCategory.NEUTRAL, 0.8f, 1.8f)
+            world.spawnParticle(Particle.CRIT, arrow.location, 12, 0.2, 0.2, 0.2, 0.1)
+            world.spawnParticle(Particle.ELECTRIC_SPARK, arrow.location, 10, 0.2, 0.2, 0.2, 0.05)
+        } finally {
+            if (arrow.isValid) {
+                arrow.remove()
+            }
         }
-
-        val newVelocity = reflectDir.clone().multiply(speed)
-        val spawnLoc = arrow.location.clone().add(reflectDir.clone().multiply(0.8))
-        spawnLoc.direction = newVelocity
-
-        // Spawn a reflected arrow of the exact same type with the same velocity, damage, and crit state
-        val world = golem.world
-        world.spawn(spawnLoc, arrow.javaClass) { reflected ->
-            reflected.shooter = golem
-            reflected.velocity = newVelocity
-            reflected.damage = arrow.damage
-            reflected.isCritical = arrow.isCritical
-            reflected.pierceLevel = arrow.pierceLevel
-            reflected.fireTicks = arrow.fireTicks
-            reflected.pickupStatus = AbstractArrow.PickupStatus.DISALLOWED
-        }
-
-        // Deflection sound & spark particles
-        world.playSound(arrow.location, Sound.ITEM_SHIELD_BLOCK, SoundCategory.NEUTRAL, 1.5f, 1.2f)
-        world.playSound(arrow.location, Sound.BLOCK_ANVIL_LAND, SoundCategory.NEUTRAL, 0.8f, 1.8f)
-        world.spawnParticle(Particle.CRIT, arrow.location, 12, 0.2, 0.2, 0.2, 0.1)
-        world.spawnParticle(Particle.ELECTRIC_SPARK, arrow.location, 10, 0.2, 0.2, 0.2, 0.05)
-
-        arrow.remove()
     }
 
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
     fun onDreadnoughtDamage(event: EntityDamageEvent) {
         val golem = event.entity as? IronGolem ?: return
         val fight = manager.getFight(golem) ?: return
+        fight.rebindGolem(golem)
 
         if (event.cause == EntityDamageEvent.DamageCause.FALL ||
             event.cause == EntityDamageEvent.DamageCause.PROJECTILE

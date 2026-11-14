@@ -76,6 +76,40 @@ class TravellerManager(private val plugin: TravellersTales) {
 
     fun isDaytime(): Boolean = !isNighttime()
 
+    /**
+     * Shared check for both Traveller and Giant:
+     * Returns true if the player is currently within their 3-day deferral window
+     * after fighting/killing any boss or being killed by any boss.
+     */
+    fun isDeferredByRecentBoss(player: Player): Boolean {
+        val deferUntilDay = player.persistentDataContainer.get(
+            MobKeys.NIGHT_BOSS_DEFER_UNTIL_DAY,
+            PersistentDataType.LONG
+        ) ?: return false
+
+        val currentDay = getCurrentDayNumber()
+        if (currentDay >= deferUntilDay) {
+            player.persistentDataContainer.remove(MobKeys.NIGHT_BOSS_DEFER_UNTIL_DAY)
+            return false
+        }
+        return true
+    }
+
+    /**
+     * Defers both The Traveller and The Giant from naturally spawning for [player]
+     * for 3 full days (`currentDay + 3L`).
+     * Called whenever any boss is killed or kills a player.
+     */
+    fun deferNaturalBossesForThreeDays(player: Player) {
+        val targetDay = getCurrentDayNumber() + 3L
+        player.persistentDataContainer.set(
+            MobKeys.NIGHT_BOSS_DEFER_UNTIL_DAY,
+            PersistentDataType.LONG,
+            targetDay
+        )
+        deferredToDay[player.uniqueId] = targetDay
+    }
+
     private fun isOnFiveDayCooldown(player: Player): Boolean {
         val until = player.persistentDataContainer.get(MobKeys.TRAVELLER_COOLDOWN_UNTIL, PersistentDataType.LONG)
             ?: return false
@@ -92,23 +126,23 @@ class TravellerManager(private val plugin: TravellersTales) {
         player.persistentDataContainer.remove(MobKeys.TRAVELLER_ESCAPED)
         player.setStatistic(Statistic.TIME_SINCE_REST, 0)
         deferredToDay.remove(player.uniqueId)
+        deferNaturalBossesForThreeDays(player)
     }
 
     private fun hasEscapedPendingRespawn(player: Player): Boolean {
         return player.persistentDataContainer.has(MobKeys.TRAVELLER_ESCAPED, PersistentDataType.BYTE)
     }
 
-    // Checks if a Traveller is currently hunting this player, or if the player is due to spawn one tonight
     fun isPlayerEngagedOrDue(player: Player): Boolean {
         if (activeFights.values.any { it.huntedPlayerId == player.uniqueId }) return true
-        if (!hasKilledEnderDragon(player) || isOnFiveDayCooldown(player)) return false
+        if (!hasKilledEnderDragon(player) || isOnFiveDayCooldown(player) || isDeferredByRecentBoss(player)) return false
         val sleeplessEligible = player.getStatistic(Statistic.TIME_SINCE_REST) >= config.sleeplessTicksRequired
         val escapedEligible = hasEscapedPendingRespawn(player)
         return sleeplessEligible || escapedEligible
     }
 
     private fun checkNightQueueAndSpawn() {
-        if (activeFights.values.any { it.entity.isValid && !it.entity.isDead }) return
+        if (activeFights.values.any { !it.entity.isDead }) return
         if (!isNighttime()) return
         val currentDay = getCurrentDayNumber()
         if (lastSpawnedNightDay == currentDay) return
@@ -120,6 +154,10 @@ class TravellerManager(private val plugin: TravellersTales) {
             if (!hasKilledEnderDragon(player)) continue
             if (isOnFiveDayCooldown(player)) continue
 
+            // Prevent spawning within 3 days of any boss kill / player death to a boss
+            if (isDeferredByRecentBoss(player)) continue
+            if (plugin.giantManager.isPlayerEngagedOrSpawnedTonight(player)) continue
+
             val sleeplessEligible = player.getStatistic(Statistic.TIME_SINCE_REST) >= config.sleeplessTicksRequired
             val escapedEligible = hasEscapedPendingRespawn(player)
             if (!sleeplessEligible && !escapedEligible) {
@@ -127,8 +165,6 @@ class TravellerManager(private val plugin: TravellersTales) {
                 continue
             }
 
-            // If player is in a restricted biome (Mushroom Fields, Ocean, River, Deep Dark) or 500x500 Overworld spawn,
-            // skip without consuming eligibility so it spawns when they step out into another biome or on the next night!
             if (!isInValidSpawnEnvironment(player)) continue
 
             val targetDay = deferredToDay[player.uniqueId]
@@ -155,6 +191,7 @@ class TravellerManager(private val plugin: TravellersTales) {
         val spawnLoc = findSafeSpawnNear(chosenPlayer.location) ?: return
         lastSpawnedNightDay = currentDay
         deferredToDay.remove(chosenPlayer.uniqueId)
+        deferNaturalBossesForThreeDays(chosenPlayer)
 
         spawnTraveller(spawnLoc, chosenPlayer.uniqueId)
     }
@@ -163,17 +200,14 @@ class TravellerManager(private val plugin: TravellersTales) {
         val loc = player.location
         val world = loc.world ?: return false
 
-        // 1. Validate biome (no Mushroom Fields, Deep Dark, Oceans, or Rivers)
         if (!BiomeValidator.isValidTravellerBiome(loc)) return false
 
-        // 2. Overworld: must be outside, on surface, and outside the 500x500 spawn safe zone (-250..250 X/Z)
         return if (world.environment == World.Environment.NORMAL) {
             if (abs(loc.x) <= 250.0 && abs(loc.z) <= 250.0) return false
             if (loc.block.lightFromSky < config.minSurfaceSkyLight) return false
             val highestY = world.getHighestBlockYAt(loc)
             loc.blockY >= highestY - 4
         } else {
-            // Nether and End bypass the 500x500 safe zone
             true
         }
     }
@@ -183,11 +217,10 @@ class TravellerManager(private val plugin: TravellersTales) {
 
         repeat(30) {
             val angle = Random.nextDouble(0.0, 2.0 * Math.PI)
-            val dist = Random.nextDouble(32.0, 48.0) // At least 32 blocks away
+            val dist = Random.nextDouble(32.0, 48.0)
             val x = (playerLoc.x + cos(angle) * dist).toInt()
             val z = (playerLoc.z + sin(angle) * dist).toInt()
 
-            // 500x500 Safe Zone check in the Overworld (-250..250 X/Z)
             if (world.environment == World.Environment.NORMAL && abs(x) <= 250 && abs(z) <= 250) {
                 return@repeat
             }
@@ -210,7 +243,6 @@ class TravellerManager(private val plugin: TravellersTales) {
                     return candidate
                 }
             } else {
-                // Nether or End: search vertically around player's Y level
                 val baseCheck = Location(world, x + 0.5, playerLoc.y, z + 0.5)
                 for (dy in 4 downTo -5) {
                     val check = baseCheck.clone().add(0.0, dy.toDouble(), 0.0)
@@ -238,7 +270,7 @@ class TravellerManager(private val plugin: TravellersTales) {
     }
 
     fun handlePlayerEscaped(fight: ActiveTravellerFight) {
-        activeFights.remove(fight.entity.uniqueId)
+        activeFights.remove(fight.travellerId)
         fight.playRiftVanishAndCleanup()
 
         val targetId = fight.huntedPlayerId ?: return
@@ -247,11 +279,12 @@ class TravellerManager(private val plugin: TravellersTales) {
 
         Bukkit.getPlayer(targetId)?.let { player ->
             player.persistentDataContainer.set(MobKeys.TRAVELLER_ESCAPED, PersistentDataType.BYTE, 1)
+            player.persistentDataContainer.set(MobKeys.NIGHT_BOSS_DEFER_UNTIL_DAY, PersistentDataType.LONG, nextNightDay)
         }
     }
 
     fun handleTravellerKilledByPlayer(fight: ActiveTravellerFight, killer: Player?) {
-        activeFights.remove(fight.entity.uniqueId)
+        activeFights.remove(fight.travellerId)
         fight.onDeath()
 
         killer?.let { applyFiveDayCooldown(it) }
@@ -262,25 +295,33 @@ class TravellerManager(private val plugin: TravellersTales) {
 
     fun handlePlayerKilledByTraveller(fight: ActiveTravellerFight, deadPlayer: Player) {
         applyFiveDayCooldown(deadPlayer)
-        activeFights.remove(fight.entity.uniqueId)
+        activeFights.remove(fight.travellerId)
         fight.playRiftVanishAndCleanup()
     }
 
-    fun getFight(entity: org.bukkit.entity.Entity): ActiveTravellerFight? = activeFights[entity.uniqueId]
+    fun getFight(entity: org.bukkit.entity.Entity): ActiveTravellerFight? {
+        val fight = activeFights[entity.uniqueId]
+        if (fight != null && entity is WitherSkeleton && entity.isValid && fight.entity !== entity) {
+            fight.rebindEntity(entity)
+        }
+        return fight
+    }
 
     fun getFightHuntingPlayer(playerId: UUID): ActiveTravellerFight? =
         activeFights.values.firstOrNull { it.huntedPlayerId == playerId }
 
     fun generateDrops(): List<ItemStack> {
         val drops = mutableListOf<ItemStack>()
-        drops.add(ItemStack(Material.GOLD_INGOT, Random.nextInt(16, 33)))
-        drops.add(ItemStack(Material.ANCIENT_DEBRIS, 1))
-        if (Random.nextDouble() <= 0.20) {
-            drops.add(ItemStack(Material.NETHERITE_UPGRADE_SMITHING_TEMPLATE, 1))
+        drops.add(ItemStack(Material.GOLD_INGOT, 32))
+
+        val roll = Random.nextDouble()
+        val bonusDrop = when {
+            roll < 0.20 -> ItemStack(Material.NETHERITE_UPGRADE_SMITHING_TEMPLATE, 1)
+            roll < 0.55 -> ItemStack(Material.ANCIENT_DEBRIS, 4)
+            else -> ItemStack(Material.NETHERITE_SCRAP, 2)
         }
-        if (Random.nextDouble() <= 0.75) {
-            drops.add(ItemStack(Material.NETHERITE_SCRAP, 1))
-        }
+        drops.add(bonusDrop)
+
         return drops
     }
 

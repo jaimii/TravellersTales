@@ -116,6 +116,34 @@ class GiantManager(private val plugin: TravellersTales) {
     fun applyThreeDayCooldown(player: Player) {
         val expiresAt = System.currentTimeMillis() + config.cooldownMillis
         player.persistentDataContainer.set(MobKeys.GIANT_COOLDOWN_UNTIL, PersistentDataType.LONG, expiresAt)
+        plugin.travellerManager.deferNaturalBossesForThreeDays(player)
+    }
+
+    fun isPlayerEngagedOrSpawnedTonight(player: Player): Boolean {
+        return player.uniqueId in spawnedPlayersTonight ||
+                activeFights.values.any { it.huntedPlayerId == player.uniqueId }
+    }
+
+    fun recordGiantEncounterCooldowns(fight: ActiveGiantFight, killer: Player?) {
+        killer?.let { applyThreeDayCooldown(it) }
+        fight.huntedPlayerId?.let { id ->
+            Bukkit.getPlayer(id)?.let { hunted -> applyThreeDayCooldown(hunted) }
+        }
+    }
+
+    /**
+     * When the Giant's chunk unloads, despawn the Giant cleanly and reset the hunted player's
+     * timer back to its original 3-day cooldown so it does NOT spawn again the next night.
+     */
+    fun handleGiantChunkUnloaded(fight: ActiveGiantFight) {
+        if (fight.isDying) return
+        activeFights.remove(fight.giant.uniqueId)
+        fight.huntedPlayerId?.let { id ->
+            Bukkit.getPlayer(id)?.let { hunted ->
+                applyThreeDayCooldown(hunted)
+            }
+        }
+        fight.forceCleanup(killGiant = true)
     }
 
     private fun checkNightlyPerPlayerSpawns() {
@@ -136,22 +164,22 @@ class GiantManager(private val plugin: TravellersTales) {
                 if (player.isDead || (player.gameMode != GameMode.SURVIVAL && player.gameMode != GameMode.ADVENTURE)) continue
                 if (player.uniqueId in spawnedPlayersTonight) continue
 
-                // 1. Overworld 500x500 Safe Zone check (-250..250 X/Z)
                 if (abs(player.location.x) <= config.safeZoneHalfSize && abs(player.location.z) <= config.safeZoneHalfSize) {
                     continue
                 }
 
-                // 2. Biome & Altitude Check
                 if (!BiomeValidator.isValidGiantBiome(player.location)) {
                     continue
                 }
 
-                // 3. Traveller Conflict Check
+                // Mutual Exclusion & 3-Day Deferral Check
+                if (plugin.travellerManager.isDeferredByRecentBoss(player)) {
+                    continue
+                }
                 if (plugin.travellerManager.isPlayerEngagedOrDue(player)) {
                     continue
                 }
 
-                // 4. Pre-Dragon vs Post-Dragon progression check
                 val killedDragon = hasKilledEnderDragon(player)
                 if (!killedDragon) {
                     if (currentDay % config.preDragonIntervalDays != 0L) {
@@ -168,6 +196,7 @@ class GiantManager(private val plugin: TravellersTales) {
 
                 val spawnLoc = findSmartGiantSpawnLocation(player.location) ?: continue
                 spawnedPlayersTonight.add(player.uniqueId)
+                applyThreeDayCooldown(player)
                 spawnGiant(spawnLoc, player.uniqueId)
             }
         }
@@ -178,7 +207,7 @@ class GiantManager(private val plugin: TravellersTales) {
 
         repeat(24) {
             val angle = Random.nextDouble(0.0, 2.0 * Math.PI)
-            val dist = Random.nextDouble(32.0, 48.0) // At least 32 blocks away
+            val dist = Random.nextDouble(32.0, 48.0)
             val x = (playerLoc.x + cos(angle) * dist).toInt()
             val z = (playerLoc.z + sin(angle) * dist).toInt()
 
@@ -205,15 +234,9 @@ class GiantManager(private val plugin: TravellersTales) {
         return null
     }
 
-    /**
-     * Optimized Fast-Exit Clearance Scan:
-     * Tests the base block + 4 ground corners, then tests the 8 outer perimeter corners.
-     * Aborts in ~8 block reads on invalid terrain instead of reading all 637 blocks!
-     */
     private fun hasGiantClearance(loc: Location): Boolean {
         val center = loc.block
 
-        // 1. Footing test: center and 4 ground corners must be solid non-liquid
         val baseBlock = center.getRelative(0, -1, 0)
         if (!baseBlock.type.isSolid || baseBlock.isLiquid) return false
         val groundCorners = listOf(
@@ -222,7 +245,6 @@ class GiantManager(private val plugin: TravellersTales) {
         )
         if (groundCorners.any { !it.type.isSolid || it.isLiquid }) return false
 
-        // 2. Fast-Exit: 8 perimeter corners of the 7x13x7 volume
         val perimeterCorners = listOf(
             center.getRelative(-3, 0, -3), center.getRelative(3, 0, -3),
             center.getRelative(-3, 0, 3), center.getRelative(3, 0, 3),
@@ -233,7 +255,6 @@ class GiantManager(private val plugin: TravellersTales) {
             return false
         }
 
-        // 3. Full interior clearance check
         for (x in -3..3) {
             for (z in -3..3) {
                 for (y in 0..12) {
@@ -260,17 +281,11 @@ class GiantManager(private val plugin: TravellersTales) {
     fun handleGiantKilledByPlayer(fight: ActiveGiantFight, killer: Player?) {
         activeFights.remove(fight.giant.uniqueId)
         fight.onDeath()
-
-        killer?.let { if (hasKilledEnderDragon(it)) applyThreeDayCooldown(it) }
-        fight.huntedPlayerId?.let { id ->
-            Bukkit.getPlayer(id)?.let { if (hasKilledEnderDragon(it)) applyThreeDayCooldown(it) }
-        }
+        recordGiantEncounterCooldowns(fight, killer)
     }
 
     fun handlePlayerKilledByGiant(fight: ActiveGiantFight, deadPlayer: Player) {
-        if (hasKilledEnderDragon(deadPlayer)) {
-            applyThreeDayCooldown(deadPlayer)
-        }
+        applyThreeDayCooldown(deadPlayer)
     }
 
     fun getFight(entity: org.bukkit.entity.Entity): ActiveGiantFight? = activeFights[entity.uniqueId]

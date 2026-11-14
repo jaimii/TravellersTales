@@ -15,9 +15,6 @@ data class GiantConfig(
     val reinforcementsChance: Double,
     val expLevelsDropped: Int,
     val bossBar: BossBarSettings,
-    val jumpIntervalTicks: Long,
-    val earthquakeRadius: Double,
-    val earthquakeDamage: Double,
     val deathZombiesMin: Int,
     val deathZombiesMax: Int,
     // Spawning & Cooldown Settings
@@ -28,17 +25,31 @@ data class GiantConfig(
     val cooldownMillis: Long = postDragonCooldownDays * 20L * 60L * 1000L
 
     companion object {
+        private const val DEFAULT_SMALL_CAPS_NAME = "<bold><green>ɢɪᴀɴᴛ</green></bold>"
+
         fun load(config: FileConfiguration): GiantConfig {
             val sec = config.getConfigurationSection("giant")
             val barSec = sec?.getConfigurationSection("boss-bar")
             val skillSec = sec?.getConfigurationSection("skills")
             val spawnSec = sec?.getConfigurationSection("spawning")
 
-            val name = sec?.getString("display-name") ?: "<bold><green>Giant</green></bold>"
+            val rawName = sec?.getString("display-name")
+            val name = if (rawName.isNullOrBlank() || rawName == "<bold><green>Giant</green></bold>") {
+                DEFAULT_SMALL_CAPS_NAME
+            } else {
+                rawName
+            }
+
+            val rawBarTitle = barSec?.getString("title")
+            val barTitle = if (rawBarTitle.isNullOrBlank() || rawBarTitle == "<bold><green>Giant</green></bold>") {
+                name
+            } else {
+                rawBarTitle
+            }
 
             val barSettings = BossBarSettings(
                 enabled = barSec?.getBoolean("enabled", true) ?: true,
-                title = barSec?.getString("title") ?: name,
+                title = barTitle,
                 color = BossBar.Color.GREEN,
                 overlay = BossBar.Overlay.PROGRESS,
                 flags = if (barSec?.getBoolean("darken-sky", true) != false) setOf(BossBar.Flag.DARKEN_SCREEN) else emptySet(),
@@ -59,9 +70,6 @@ data class GiantConfig(
                 reinforcementsChance = (sec?.getDouble("reinforcements-chance", 0.38) ?: 0.38).coerceIn(0.0, 1.0),
                 expLevelsDropped = (sec?.getInt("exp-levels-dropped", 50) ?: 50).coerceAtLeast(0),
                 bossBar = barSettings,
-                jumpIntervalTicks = (skillSec?.getLong("jump-interval-ticks", 220L) ?: 220L).coerceAtLeast(40L),
-                earthquakeRadius = (skillSec?.getDouble("earthquake-radius", 8.0) ?: 8.0).coerceAtLeast(2.0),
-                earthquakeDamage = (skillSec?.getDouble("earthquake-damage", 4.0) ?: 4.0).coerceAtLeast(0.0),
                 deathZombiesMin = minZombies,
                 deathZombiesMax = maxZombies,
                 safeZoneHalfSize = (spawnSec?.getDouble("safe-zone-half-size", 250.0) ?: 250.0).coerceAtLeast(0.0),

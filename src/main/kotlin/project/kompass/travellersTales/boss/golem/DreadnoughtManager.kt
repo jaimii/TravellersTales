@@ -1,5 +1,6 @@
 package project.kompass.travellersTales.boss.golem
 
+import org.bukkit.Bukkit
 import org.bukkit.Location
 import org.bukkit.Material
 import org.bukkit.Particle
@@ -8,7 +9,10 @@ import org.bukkit.entity.Entity
 import org.bukkit.entity.IronGolem
 import org.bukkit.event.entity.CreatureSpawnEvent
 import org.bukkit.inventory.ItemStack
+import org.bukkit.persistence.PersistentDataType
+import org.bukkit.util.Vector
 import project.kompass.travellersTales.TravellersTales
+import project.kompass.travellersTales.registry.MobKeys
 import java.util.UUID
 
 class DreadnoughtManager(private val plugin: TravellersTales) {
@@ -24,6 +28,19 @@ class DreadnoughtManager(private val plugin: TravellersTales) {
         Material.PUMPKIN
     )
 
+    init {
+        // Re-attach any existing Dreadnought Golems in loaded worlds on startup/reload
+        Bukkit.getScheduler().runTask(plugin, Runnable {
+            for (world in Bukkit.getWorlds()) {
+                for (golem in world.getEntitiesByClass(IronGolem::class.java)) {
+                    if (isDreadnoughtEntity(golem)) {
+                        rebindOrRestoreGolem(golem)
+                    }
+                }
+            }
+        })
+    }
+
     fun reloadConfig() {
         plugin.reloadConfig()
         config = DreadnoughtConfig.load(plugin.config)
@@ -33,12 +50,43 @@ class DreadnoughtManager(private val plugin: TravellersTales) {
         }
     }
 
+    fun isDreadnoughtEntity(entity: Entity): Boolean {
+        val mobId = entity.persistentDataContainer.get(MobKeys.MOB_ID, PersistentDataType.STRING)
+        return mobId == "dreadnought_golem"
+    }
+
     /**
-     * Checks if placing [placedBlock] completes the Dreadnought Golem multiblock pattern:
-     *       [Pumpkin]       (0, +1, 0)
-     * [Iron] [Beacon] [Iron] (0,  0, 0) along X or Z axis
-     *        [Iron]         (0, -1, 0)
+     * Re-binds a Dreadnought Golem when its chunk reloads, or restores its ActiveDreadnoughtFight
+     * if it was loaded from disk without an active fight in memory.
      */
+    fun rebindOrRestoreGolem(golem: IronGolem): ActiveDreadnoughtFight? {
+        if (!golem.isValid || golem.isDead) return null
+
+        val existing = activeFights[golem.uniqueId]
+        // If it was unloaded mid-death-animation (or saved at <= 1 HP while marked invulnerable), finish removing it cleanly
+        if ((existing != null && existing.isDying) || (golem.isMarkedInvulnerable && golem.health <= 1.0)) {
+            val dropLoc = golem.location.add(0.0, 1.2, 0.0)
+            golem.world.dropItemNaturally(dropLoc, ItemStack(Material.BEACON, 1)) { item ->
+                item.isGlowing = true
+                item.velocity = item.velocity.add(Vector(0.0, 0.25, 0.0))
+            }
+            existing?.forceCleanup(killGolem = true)
+            activeFights.remove(golem.uniqueId)
+            if (golem.isValid) golem.remove()
+            return null
+        }
+
+        if (existing != null) {
+            existing.rebindGolem(golem)
+            return existing
+        }
+
+        val restoredFight = ActiveDreadnoughtFight(plugin, golem, config)
+        activeFights[golem.uniqueId] = restoredFight
+        restoredFight.start(playSpawnAnimation = false, preserveCurrentHealth = true)
+        return restoredFight
+    }
+
     fun tryConstructFromBlockPlace(placedBlock: Block): Boolean {
         if (!config.enabled) return false
         val mat = placedBlock.type
@@ -46,7 +94,6 @@ class DreadnoughtManager(private val plugin: TravellersTales) {
             return false
         }
 
-        // Search nearby 3x3x3 for a Beacon that could be the center core of the structure
         for (dx in -1..1) {
             for (dy in -1..1) {
                 for (dz in -1..1) {
@@ -70,7 +117,6 @@ class DreadnoughtManager(private val plugin: TravellersTales) {
             return false
         }
 
-        // Check X-axis arms or Z-axis arms
         val xArm1 = beaconCore.getRelative(1, 0, 0)
         val xArm2 = beaconCore.getRelative(-1, 0, 0)
         val zArm1 = beaconCore.getRelative(0, 0, 1)
@@ -100,11 +146,23 @@ class DreadnoughtManager(private val plugin: TravellersTales) {
         val golem = world.spawn(location, IronGolem::class.java, CreatureSpawnEvent.SpawnReason.CUSTOM)
         val fight = ActiveDreadnoughtFight(plugin, golem, config)
         activeFights[golem.uniqueId] = fight
-        fight.start(playSpawnAnimation)
+        fight.start(playSpawnAnimation = playSpawnAnimation, preserveCurrentHealth = false)
         return fight
     }
 
-    fun getFight(entity: Entity): ActiveDreadnoughtFight? = activeFights[entity.uniqueId]
+    fun getFight(entity: Entity): ActiveDreadnoughtFight? {
+        val fight = activeFights[entity.uniqueId]
+        if (fight != null) {
+            if (entity is IronGolem && entity.isValid && fight.golem !== entity) {
+                fight.rebindGolem(entity)
+            }
+            return fight
+        }
+        if (entity is IronGolem && isDreadnoughtEntity(entity)) {
+            return rebindOrRestoreGolem(entity)
+        }
+        return null
+    }
 
     fun unregisterGolem(id: UUID) {
         activeFights.remove(id)?.onDeath()

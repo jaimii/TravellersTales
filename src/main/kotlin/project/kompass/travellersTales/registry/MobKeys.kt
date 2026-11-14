@@ -6,6 +6,8 @@ import project.kompass.travellersTales.TravellersTales
 object MobKeys {
     lateinit var MOB_ID: NamespacedKey
         private set
+    lateinit var BOSS_CUSTOM_HEALTH: NamespacedKey
+        private set
     lateinit var WITHER_MINION: NamespacedKey
         private set
     lateinit var WITHER_ARCHER: NamespacedKey
@@ -32,6 +34,8 @@ object MobKeys {
         private set
     lateinit var GIANT_COOLDOWN_UNTIL: NamespacedKey
         private set
+    lateinit var NIGHT_BOSS_DEFER_UNTIL_DAY: NamespacedKey
+        private set
     lateinit var CUBE_BOSS_MINION: NamespacedKey
         private set
     lateinit var SPECIAL_BOOTS_TYPE: NamespacedKey
@@ -53,6 +57,7 @@ object MobKeys {
 
     fun init(plugin: TravellersTales) {
         MOB_ID = NamespacedKey(plugin, "custom_mob_id")
+        BOSS_CUSTOM_HEALTH = NamespacedKey(plugin, "boss_custom_health")
         WITHER_MINION = NamespacedKey(plugin, "wither_minion")
         WITHER_ARCHER = NamespacedKey(plugin, "wither_archer")
         WITHER_TEMP_ENTITY = NamespacedKey(plugin, "wither_temp_entity")
@@ -66,6 +71,7 @@ object MobKeys {
         TRAVELLER_ESCAPED = NamespacedKey(plugin, "traveller_escaped")
         GIANT_MINION = NamespacedKey(plugin, "giant_minion")
         GIANT_COOLDOWN_UNTIL = NamespacedKey(plugin, "giant_cooldown_until")
+        NIGHT_BOSS_DEFER_UNTIL_DAY = NamespacedKey(plugin, "night_boss_defer_until_day")
         CUBE_BOSS_MINION = NamespacedKey(plugin, "cube_boss_minion")
         SPECIAL_BOOTS_TYPE = NamespacedKey(plugin, "special_boots_type")
         CUBE_BOSS_EGG = NamespacedKey(plugin, "cube_boss_egg")

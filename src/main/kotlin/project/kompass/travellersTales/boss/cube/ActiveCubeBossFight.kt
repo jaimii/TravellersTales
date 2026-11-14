@@ -14,9 +14,11 @@ import org.bukkit.scheduler.BukkitTask
 import org.bukkit.util.Vector
 import project.kompass.travellersTales.TravellersTales
 import project.kompass.travellersTales.registry.MobKeys
+import project.kompass.travellersTales.util.BossKillTracker
 import project.kompass.travellersTales.util.ExperienceUtil
 import project.kompass.travellersTales.util.mm
 import java.util.UUID
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.random.Random
@@ -50,6 +52,90 @@ class ActiveCubeBossFight(
         scheduleCoreLoops()
     }
 
+    /**
+     * Reconstructs an ActiveCubeBossFight from an existing World Slime or Magma Core loaded from disk.
+     */
+    fun restoreFromLoadedCube(loadedCube: AbstractCubeMob) {
+        currentPhase = if (loadedCube.size <= settings.phase2Size) 2 else 1
+        val maxHp = if (currentPhase == 1) settings.phase1Health else settings.phase2Health
+        val savedHp = loadedCube.persistentDataContainer.get(MobKeys.BOSS_CUSTOM_HEALTH, PersistentDataType.DOUBLE)
+            ?: loadedCube.health.takeIf { it > 0.0 }
+            ?: maxHp
+
+        loadedCube.getAttribute(Attribute.MAX_HEALTH)?.baseValue = maxHp
+        loadedCube.health = savedHp.coerceIn(1.0, maxHp)
+        loadedCube.getAttribute(Attribute.FOLLOW_RANGE)?.baseValue = settings.followRange
+        loadedCube.getAttribute(Attribute.SAFE_FALL_DISTANCE)?.baseValue = 1000.0
+        loadedCube.getAttribute(Attribute.FALL_DAMAGE_MULTIPLIER)?.baseValue = 0.0
+
+        activeCubes.clear()
+        activeCubes.add(loadedCube)
+
+        val bar = if (currentPhase == 2) {
+            settings.bossBar.copy(title = settings.bossBar.phase2Title)
+        } else {
+            settings.bossBar
+        }
+        plugin.bossBarManager.createBossBar(loadedCube, bar)
+        scheduleCoreLoops()
+    }
+
+    /**
+     * Refreshes any unloaded/reloaded CraftSlime or CraftMagmaCube wrapper in [activeCubes]
+     * by looking up its live entity via UUID so AI and slams never stop after chunk unloads.
+     */
+    fun refreshLiveCubes() {
+        val iterator = activeCubes.listIterator()
+        while (iterator.hasNext()) {
+            val current = iterator.next()
+            if (current.isDead) {
+                slammingCubes.remove(current.uniqueId)
+                plugin.bossBarManager.unregisterById(current.uniqueId)
+                iterator.remove()
+                continue
+            }
+
+            if (!current.isValid) {
+                val live = Bukkit.getEntity(current.uniqueId) as? AbstractCubeMob
+                if (live != null) {
+                    if (live.isDead) {
+                        slammingCubes.remove(live.uniqueId)
+                        plugin.bossBarManager.unregisterById(live.uniqueId)
+                        iterator.remove()
+                    } else if (live.isValid) {
+                        slammingCubes.remove(live.uniqueId)
+                        iterator.set(live)
+                        val bar = if (currentPhase == 2) {
+                            settings.bossBar.copy(title = settings.bossBar.phase2Title)
+                        } else {
+                            settings.bossBar
+                        }
+                        plugin.bossBarManager.createBossBar(live, bar)
+                    }
+                }
+            }
+        }
+    }
+
+    fun rebindCube(loadedCube: AbstractCubeMob) {
+        for (i in activeCubes.indices) {
+            if (activeCubes[i].uniqueId == loadedCube.uniqueId) {
+                val wasUnloaded = !activeCubes[i].isValid
+                activeCubes[i] = loadedCube
+                if (wasUnloaded) {
+                    slammingCubes.remove(loadedCube.uniqueId)
+                }
+                val bar = if (currentPhase == 2) {
+                    settings.bossBar.copy(title = settings.bossBar.phase2Title)
+                } else {
+                    settings.bossBar
+                }
+                plugin.bossBarManager.createBossBar(loadedCube, bar)
+                return
+            }
+        }
+    }
+
     private fun spawnBossCube(location: Location, size: Int, maxHealth: Double, nameMiniMessage: String): AbstractCubeMob {
         return world.spawn(location, type.entityClass, CreatureSpawnEvent.SpawnReason.CUSTOM) { cube ->
             cube.persistentDataContainer.set(MobKeys.MOB_ID, PersistentDataType.STRING, type.mobId)
@@ -62,6 +148,7 @@ class ActiveCubeBossFight(
             // Set health & combat stats AFTER setting size (since setSize resets vanilla Slime attributes)
             cube.getAttribute(Attribute.MAX_HEALTH)?.baseValue = maxHealth
             cube.health = maxHealth
+            cube.persistentDataContainer.set(MobKeys.BOSS_CUSTOM_HEALTH, PersistentDataType.DOUBLE, maxHealth)
             cube.getAttribute(Attribute.FOLLOW_RANGE)?.baseValue = settings.followRange // 64.0
             cube.getAttribute(Attribute.KNOCKBACK_RESISTANCE)?.baseValue = if (currentPhase == 1) 0.75 else 0.45
             cube.getAttribute(Attribute.ATTACK_DAMAGE)?.baseValue = if (currentPhase == 1) 12.0 else 7.0
@@ -95,14 +182,19 @@ class ActiveCubeBossFight(
             }
         }
 
-        // 20-Tick (1s) Loop: MaxCombatDistance (256.0) & Target Acquisition
+        // 20-Tick (1s) Loop: Chunk-Reload Re-binding, MaxCombatDistance (256.0) & Target Acquisition
         runTimer(20L, 20L) {
             if (isCompleted) return@runTimer
+            refreshLiveCubes()
 
             for (cube in activeCubes.toList()) {
                 if (!cube.isValid || cube.isDead) continue
 
-                if (cube.location.distanceSquared(spawnOrigin) > settings.maxCombatDistanceSquared) {
+                cube.persistentDataContainer.set(MobKeys.BOSS_CUSTOM_HEALTH, PersistentDataType.DOUBLE, cube.health)
+
+                if (cube.world == spawnOrigin.world &&
+                    cube.location.distanceSquared(spawnOrigin) > settings.maxCombatDistanceSquared
+                ) {
                     cube.teleport(spawnOrigin)
                 }
 
@@ -116,13 +208,14 @@ class ActiveCubeBossFight(
         // Special Attack Loop: Sky-High Jump & Ground Slam
         runTimer(settings.slamIntervalTicks, settings.slamIntervalTicks) {
             if (isCompleted) return@runTimer
+            refreshLiveCubes()
 
             for (cube in activeCubes.toList()) {
                 if (!cube.isValid || cube.isDead) continue
-                if (cube.uniqueId in slammingCubes || !cube.isOnGround) continue
+                if (cube.uniqueId in slammingCubes) continue
 
                 val target = resolveTarget(cube) ?: continue
-                if (cube.location.distanceSquared(target.location) <= 1024.0) { // Within 32 blocks
+                if (cube.location.distanceSquared(target.location) <= 1600.0) { // Within 40 blocks
                     performSkyHighJumpSlam(cube, target)
                 }
             }
@@ -134,15 +227,14 @@ class ActiveCubeBossFight(
     // ========================================================================
 
     fun onBossDealAttack(attackerCube: AbstractCubeMob, victim: LivingEntity) {
+        rebindCube(attackerCube)
         if (type == CubeBossType.WORLD_SLIME) {
-            // Apply Oozing ("slimed") for 30 seconds (600 ticks)
             victim.addPotionEffect(
                 PotionEffect(PotionEffectType.OOZING, settings.debuffDurationTicks, 0, false, true, true)
             )
             world.playSound(victim.location, Sound.ENTITY_SLIME_SQUISH, SoundCategory.HOSTILE, 1.5f, 0.7f)
             spawnNormalMinions(attackerCube.location, count = 1, size = 2)
         } else {
-            // Set on fire for 30 seconds (600 ticks)
             victim.fireTicks = victim.fireTicks.coerceAtLeast(settings.debuffDurationTicks)
             world.playSound(victim.location, Sound.ITEM_FIRECHARGE_USE, SoundCategory.HOSTILE, 1.5f, 0.8f)
             spawnNormalMinions(attackerCube.location, count = 1, size = 2)
@@ -153,10 +245,11 @@ class ActiveCubeBossFight(
     // SPECIAL ATTACK: SKY-HIGH JUMP & GROUND SLAM
     // ========================================================================
 
-    private fun performSkyHighJumpSlam(cube: AbstractCubeMob, target: LivingEntity) {
-        slammingCubes.add(cube.uniqueId)
+    private fun performSkyHighJumpSlam(initialCube: AbstractCubeMob, target: LivingEntity) {
+        val cubeId = initialCube.uniqueId
+        slammingCubes.add(cubeId)
 
-        val launchOrigin = cube.location.clone()
+        val launchOrigin = initialCube.location.clone()
         world.playSound(launchOrigin, Sound.ENTITY_SLIME_JUMP, SoundCategory.HOSTILE, 3.0f, 0.5f)
         world.playSound(launchOrigin, Sound.ENTITY_BREEZE_WIND_BURST, SoundCategory.HOSTILE, 2.0f, 0.6f)
         world.spawnParticle(Particle.GUST_EMITTER_SMALL, launchOrigin, 3, 1.0, 0.2, 1.0, 0.0)
@@ -165,15 +258,16 @@ class ActiveCubeBossFight(
         // Launch very high into the air toward target
         val toTarget = target.location.toVector().subtract(launchOrigin.toVector()).setY(0.0)
         if (toTarget.lengthSquared() > 1e-4) toTarget.normalize()
-        cube.velocity = Vector(toTarget.x * 0.75, 1.75, toTarget.z * 0.75)
+        initialCube.velocity = Vector(toTarget.x * 0.75, 1.75, toTarget.z * 0.75)
 
         var airborneTicks = 0
         var hasStartedPlunge = false
         var slamTask: BukkitTask? = null
         slamTask = runTimer(1L, 1L) {
             airborneTicks++
-            if (!cube.isValid || cube.isDead || airborneTicks > 120) {
-                slammingCubes.remove(cube.uniqueId)
+            val cube = activeCubes.firstOrNull { it.uniqueId == cubeId }
+            if (cube == null || !cube.isValid || cube.isDead || airborneTicks > 120) {
+                slammingCubes.remove(cubeId)
                 slamTask?.cancel()
                 return@runTimer
             }
@@ -197,8 +291,11 @@ class ActiveCubeBossFight(
             }
 
             // Detect ground impact after launch
-            if (airborneTicks > 10 && cube.isOnGround) {
-                slammingCubes.remove(cube.uniqueId)
+            val groundedAfterPlunge = hasStartedPlunge && airborneTicks >= 25 &&
+                    (cube.isOnGround || (abs(cube.velocity.y) < 0.08 && !cLoc.clone().subtract(0.0, 0.4, 0.0).block.isPassable))
+
+            if ((airborneTicks > 12 && cube.isOnGround) || groundedAfterPlunge) {
+                slammingCubes.remove(cubeId)
                 slamTask?.cancel()
                 executeGroundSlamImpact(cube)
             }
@@ -258,7 +355,7 @@ class ActiveCubeBossFight(
             .build()
 
         origin.getNearbyLivingEntities(radius, 5.0, radius).forEach { victim ->
-            if (victim in activeCubes) return@forEach
+            if (activeCubes.any { it.uniqueId == victim.uniqueId }) return@forEach
             if (victim.persistentDataContainer.has(MobKeys.CUBE_BOSS_MINION, PersistentDataType.BYTE)) return@forEach
 
             val dx = victim.location.x - origin.x
@@ -289,7 +386,6 @@ class ActiveCubeBossFight(
             for (z in -radius..radius) {
                 if ((x * x + z * z) > radiusSq) continue
 
-                // Turn Grass Blocks, Mycelium, and Podzol into Dirt
                 for (y in -2..1) {
                     val ground = centerBlock.getRelative(x, y, z)
                     if (ground.type == Material.GRASS_BLOCK ||
@@ -300,7 +396,6 @@ class ActiveCubeBossFight(
                     }
                 }
 
-                // Break foliage & leaves, and set ground on fire for Magma Core
                 for (y in -1..4) {
                     val b = centerBlock.getRelative(x, y, z)
                     if (isBreakableFoliage(b)) {
@@ -310,7 +405,7 @@ class ActiveCubeBossFight(
 
                 if (type == CubeBossType.MAGMA_CORE && Random.nextDouble() < 0.28) {
                     val surfaceY = world.getHighestBlockYAt(centerBlock.x + x, centerBlock.z + z)
-                    if (kotlin.math.abs(surfaceY - centerBlock.y) <= 4) {
+                    if (abs(surfaceY - centerBlock.y) <= 4) {
                         val fireBlock = world.getBlockAt(centerBlock.x + x, surfaceY + 1, centerBlock.z + z)
                         val below = fireBlock.getRelative(0, -1, 0)
                         if (fireBlock.type.isAir && below.type.isSolid) {
@@ -342,9 +437,11 @@ class ActiveCubeBossFight(
     // ========================================================================
 
     fun handleCubeDeath(deadCube: AbstractCubeMob) {
-        activeCubes.remove(deadCube)
+        refreshLiveCubes()
+        // Only remove the dead cube (or any other cube that is genuinely dead, NOT merely unloaded!)
+        activeCubes.removeIf { it.uniqueId == deadCube.uniqueId || it.isDead }
         slammingCubes.remove(deadCube.uniqueId)
-        plugin.bossBarManager.unregisterEntity(deadCube)
+        plugin.bossBarManager.unregisterById(deadCube.uniqueId)
 
         val deathLoc = deadCube.location.clone()
 
@@ -382,7 +479,7 @@ class ActiveCubeBossFight(
 
         // When BOTH Phase 2 twins are dead, drop the Special Boots & configured EXP!
         if (activeCubes.isEmpty()) {
-            completeFightAndDropRewards(deathLoc)
+            completeFightAndDropRewards(deathLoc, deadCube.killer)
         }
     }
 
@@ -399,15 +496,20 @@ class ActiveCubeBossFight(
         }
     }
 
-    private fun completeFightAndDropRewards(finalLocation: Location) {
+    private fun completeFightAndDropRewards(finalLocation: Location, killer: Player?) {
         if (isCompleted) return
         isCompleted = true
         cancelAllTasks()
 
+        val participants = HashSet<Player>()
+        killer?.let { participants.add(it) }
+        participants.addAll(finalLocation.getNearbyPlayers(64.0))
+        participants.forEach { BossKillTracker.recordBossKill(it, type.mobId) }
+
         val dropLoc = finalLocation.clone().add(0.0, 0.8, 0.0)
         world.playSound(dropLoc, Sound.UI_TOAST_CHALLENGE_COMPLETE, SoundCategory.PLAYERS, 1.5f, 1.0f)
         world.playSound(dropLoc, Sound.ENTITY_GENERIC_EXPLODE, SoundCategory.HOSTILE, 2.5f, 0.9f)
-        world.spawnParticle(Particle.FLASH, dropLoc, 2)
+        world.spawnParticle(Particle.FLASH, dropLoc, 2, 0.0, 0.0, 0.0, 0.0, type.primaryColor)
         world.spawnParticle(
             Particle.DUST_COLOR_TRANSITION,
             dropLoc,
@@ -419,7 +521,7 @@ class ActiveCubeBossFight(
         val boots = plugin.cubeBossManager.createSpecialBoots(type)
         world.dropItemNaturally(dropLoc, boots) { item ->
             item.isGlowing = true
-            item.isInvulnerable = true
+            item.setInvulnerable(true)
             item.velocity = Vector(0.0, 0.35, 0.0)
         }
 
@@ -432,8 +534,12 @@ class ActiveCubeBossFight(
         isCompleted = true
         cancelAllTasks()
         activeCubes.toList().forEach { cube ->
-            plugin.bossBarManager.unregisterEntity(cube)
-            if (cube.isValid) cube.remove()
+            plugin.bossBarManager.unregisterById(cube.uniqueId)
+            if (cube.isValid) {
+                cube.remove()
+            } else {
+                (Bukkit.getEntity(cube.uniqueId) as? AbstractCubeMob)?.remove()
+            }
         }
         activeCubes.clear()
         slammingCubes.clear()

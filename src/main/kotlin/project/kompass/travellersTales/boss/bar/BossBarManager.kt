@@ -4,13 +4,16 @@ import net.kyori.adventure.bossbar.BossBar
 import org.bukkit.Bukkit
 import org.bukkit.attribute.Attribute
 import org.bukkit.entity.Boss
+import org.bukkit.entity.EnderDragon
 import org.bukkit.entity.LivingEntity
 import org.bukkit.entity.Player
 import org.bukkit.event.EventHandler
+import org.bukkit.event.EventPriority
 import org.bukkit.event.Listener
 import org.bukkit.event.entity.EntityDeathEvent
 import org.bukkit.event.player.PlayerChangedWorldEvent
 import org.bukkit.event.player.PlayerQuitEvent
+import org.bukkit.event.world.EntitiesLoadEvent
 import org.bukkit.plugin.java.JavaPlugin
 import project.kompass.travellersTales.util.mm
 import java.util.UUID
@@ -18,10 +21,10 @@ import kotlin.math.abs
 
 class BossBarManager : Listener {
 
-    private data class TrackedBossBar(
-        val boss: LivingEntity,
+    private class TrackedBossBar(
+        var boss: LivingEntity,
         val bar: BossBar,
-        val settings: BossBarSettings,
+        var settings: BossBarSettings,
         val viewers: MutableSet<UUID> = HashSet()
     )
 
@@ -37,18 +40,19 @@ class BossBarManager : Listener {
     }
 
     fun createBossBar(boss: LivingEntity, settings: BossBarSettings): BossBar? {
-        // Hide vanilla boss bar on Withers and Ender Dragons to avoid duplicate bars
-        if (boss is Boss) {
-            boss.bossBar?.isVisible = false
-        }
+        hideVanillaBar(boss)
 
         if (!settings.enabled) return null
 
         val existing = activeBars[boss.uniqueId]
         if (existing != null) {
+            existing.boss = boss
+            existing.settings = settings
             existing.bar.name(settings.title.mm())
             existing.bar.color(settings.color)
             existing.bar.overlay(settings.overlay)
+            updateBossBarProgress(existing)
+            updateBossBarVisibility(existing)
             return existing.bar
         }
 
@@ -67,6 +71,29 @@ class BossBarManager : Listener {
         return bar
     }
 
+    fun rebindEntity(boss: LivingEntity) {
+        hideVanillaBar(boss)
+        val tracked = activeBars[boss.uniqueId] ?: return
+        tracked.boss = boss
+        updateBossBarProgress(tracked)
+        updateBossBarVisibility(tracked)
+    }
+
+    private fun hideVanillaBar(boss: LivingEntity) {
+        if (boss is EnderDragon) {
+            boss.world.enderDragonBattle?.bossBar?.apply {
+                isVisible = false
+                removeAll()
+            }
+        }
+        if (boss is Boss) {
+            boss.bossBar?.apply {
+                isVisible = false
+                removeAll()
+            }
+        }
+    }
+
     fun updateBarAppearance(
         boss: LivingEntity,
         titleMiniMessage: String? = null,
@@ -74,6 +101,7 @@ class BossBarManager : Listener {
         overlay: BossBar.Overlay? = null
     ) {
         val tracked = activeBars[boss.uniqueId] ?: return
+        tracked.boss = boss
         titleMiniMessage?.let { tracked.bar.name(it.mm()) }
         color?.let { tracked.bar.color(it) }
         overlay?.let { tracked.bar.overlay(it) }
@@ -83,7 +111,7 @@ class BossBarManager : Listener {
         unregisterById(boss.uniqueId)
     }
 
-    private fun unregisterById(bossId: UUID) {
+    fun unregisterById(bossId: UUID) {
         val tracked = activeBars.remove(bossId) ?: return
         for (viewerId in tracked.viewers) {
             Bukkit.getPlayer(viewerId)?.hideBossBar(tracked.bar)
@@ -94,6 +122,21 @@ class BossBarManager : Listener {
     fun clearAllBars() {
         for (bossId in activeBars.keys.toList()) {
             unregisterById(bossId)
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    fun onEntitiesLoad(event: EntitiesLoadEvent) {
+        for (entity in event.entities) {
+            if (entity is LivingEntity) {
+                val tracked = activeBars[entity.uniqueId]
+                if (tracked != null) {
+                    tracked.boss = entity
+                    hideVanillaBar(entity)
+                    updateBossBarProgress(tracked)
+                    updateBossBarVisibility(tracked)
+                }
+            }
         }
     }
 
@@ -116,7 +159,6 @@ class BossBarManager : Listener {
     fun onPlayerChangedWorld(event: PlayerChangedWorldEvent) {
         val player = event.player
         activeBars.values.forEach { tracked ->
-            // If the player moved to a world different from this boss, hide the bar immediately
             if (player.world != tracked.boss.world && tracked.viewers.remove(player.uniqueId)) {
                 player.hideBossBar(tracked.bar)
             }
@@ -128,11 +170,32 @@ class BossBarManager : Listener {
 
         for (bossId in activeBars.keys.toList()) {
             val tracked = activeBars[bossId] ?: continue
-            val boss = tracked.boss
-            if (boss.isDead || !boss.isValid) {
+            var boss = tracked.boss
+
+            // NOTE: In Paper, CraftEntity#isDead() returns true when a chunk unloads (RemovalReason.UNLOADED_TO_CHUNK)!
+            // Only unregister if health <= 0.0; if !boss.isValid, keep the bar and wait for the chunk to reload!
+            if (boss.health <= 0.0) {
                 unregisterById(bossId)
                 continue
             }
+
+            if (!boss.isValid) {
+                val live = Bukkit.getEntity(bossId) as? LivingEntity
+                if (live != null && live.isValid) {
+                    if (live.health <= 0.0) {
+                        unregisterById(bossId)
+                        continue
+                    }
+                    tracked.boss = live
+                    boss = live
+                } else {
+                    // Chunk is currently unloaded: hide bar from viewers temporarily without deleting it!
+                    syncBarPlayers(tracked, emptySet())
+                    continue
+                }
+            }
+
+            hideVanillaBar(boss)
             updateBossBarProgress(tracked)
             updateBossBarVisibility(tracked)
         }
@@ -156,7 +219,6 @@ class BossBarManager : Listener {
 
         val targetPlayers = HashSet<Player>()
         for (player in bossWorld.players) {
-            // Defensive world guard prevents cross-world distance measurement crashes
             if (player.world != bossWorld) continue
             if (player.location.distanceSquared(bossLoc) <= radiusSq) {
                 targetPlayers.add(player)

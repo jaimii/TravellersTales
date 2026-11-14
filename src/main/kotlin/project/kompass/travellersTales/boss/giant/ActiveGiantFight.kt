@@ -37,8 +37,6 @@ class ActiveGiantFight(
     var isDying: Boolean = false
         private set
 
-    private var wasAirborneForSlam: Boolean = false
-    private var airborneTicks: Int = 0
     private var meleeCooldownTicks: Int = 0
     private var lastTrampleBlockLoc: Location? = null
 
@@ -59,8 +57,10 @@ class ActiveGiantFight(
         giant.persistentDataContainer.set(MobKeys.MOB_ID, PersistentDataType.STRING, "giant")
         giant.customName(config.displayName.mm())
         giant.isCustomNameVisible = false
-        giant.isPersistent = true
-        giant.removeWhenFarAway = false
+
+        // Giant is despawnable when its chunk unloads (GiantListener resets the player's timer cleanly)
+        giant.isPersistent = false
+        giant.removeWhenFarAway = true
 
         giant.getAttribute(Attribute.MAX_HEALTH)?.baseValue = config.maxHealth
         giant.health = config.maxHealth
@@ -71,7 +71,6 @@ class ActiveGiantFight(
         giant.getAttribute(Attribute.KNOCKBACK_RESISTANCE)?.baseValue = 0.85
         giant.getAttribute(Attribute.SPAWN_REINFORCEMENTS)?.baseValue = config.reinforcementsChance
 
-        // Complete Fall Damage Immunity
         giant.getAttribute(Attribute.SAFE_FALL_DISTANCE)?.baseValue = 1000.0
         giant.getAttribute(Attribute.FALL_DAMAGE_MULTIPLIER)?.baseValue = 0.0
 
@@ -79,10 +78,6 @@ class ActiveGiantFight(
             Bukkit.getPlayer(id)?.let { giant.target = it }
         }
     }
-
-    // ========================================================================
-    // CRAWL OUT OF THE GROUND INTRO ANIMATION
-    // ========================================================================
 
     private fun playCrawlOutAnimation() {
         isCrawlingOut = true
@@ -111,12 +106,11 @@ class ActiveGiantFight(
                     giant.isInvulnerable = false
                     giant.setAI(true)
                     isCrawlingOut = false
-                    triggerEarthquakeSlam()
+                    world.playSound(surfaceLoc, Sound.ENTITY_ZOMBIE_AMBIENT, SoundCategory.HOSTILE, 3.5f, 0.5f)
                 }
                 return@runTimer
             }
 
-            // Rise 11.5 blocks over 60 ticks while lurching shoulders left and right
             val progress = tick / 60.0
             val currentY = buriedLoc.y + (11.5 * progress)
             val lurchYaw = surfaceLoc.yaw + (sin(tick * 0.35) * 18.0).toFloat()
@@ -137,56 +131,27 @@ class ActiveGiantFight(
         }
     }
 
-    // ========================================================================
-    // CORE AI & SPECIAL ATTACK LOOPS
-    // ========================================================================
-
     private fun scheduleCoreLoops() {
-        // 1-Tick Loop: Airborne / Ground Landing Detection & Fallback AI
         runTimer(1L, 1L) {
             if (!giant.isValid || giant.isDead || isCrawlingOut || isDying) return@runTimer
 
             if (meleeCooldownTicks > 0) meleeCooldownTicks--
-
-            // Track airborne state for Earthquake Slam on landing
-            if (!giant.isOnGround) {
-                airborneTicks++
-                if (airborneTicks >= 8 || giant.velocity.y < -0.35) {
-                    wasAirborneForSlam = true
-                }
-            } else {
-                if (wasAirborneForSlam) {
-                    wasAirborneForSlam = false
-                    airborneTicks = 0
-                    triggerEarthquakeSlam()
-                }
-                airborneTicks = 0
-            }
 
             if (useFallbackAi) {
                 tickCustomGiantAi()
             }
         }
 
-        // 5-Tick Loop: Break Leaves/Foliage & Turn Grass Blocks into Dirt
         runTimer(5L, 5L) {
             if (!giant.isValid || giant.isDead || isCrawlingOut || isDying) return@runTimer
             tickFoliageAndGrassTrample()
         }
 
-        // Periodic Earthquake Jump Skill (~every 11 seconds)
-        runTimer(config.jumpIntervalTicks, config.jumpIntervalTicks) {
+        runTimer(20L, 20L) {
             if (!giant.isValid || giant.isDead || isCrawlingOut || isDying) return@runTimer
-            if (!giant.isOnGround) return@runTimer
 
             if (giant.location.distanceSquared(spawnOrigin) > config.maxCombatDistance * config.maxCombatDistance) {
                 giant.teleport(spawnOrigin)
-                return@runTimer
-            }
-
-            val target = resolveTarget() ?: return@runTimer
-            if (giant.location.distanceSquared(target.location) <= 900.0) { // Within 30 blocks
-                performEarthquakeJump(target)
             }
         }
     }
@@ -233,15 +198,10 @@ class ActiveGiantFight(
         }
     }
 
-    // ========================================================================
-    // FOLIAGE TRAMPLE & TERRAFORMING (OPTIMIZED)
-    // ========================================================================
-
     private fun tickFoliageAndGrassTrample() {
         val currentLoc = giant.location
         val center = currentLoc.block
 
-        // 1. Trample grass beneath feet into dirt
         for (x in -2..2) {
             for (z in -2..2) {
                 for (y in -1..0) {
@@ -256,14 +216,12 @@ class ActiveGiantFight(
             }
         }
 
-        // 2. Only scan upper foliage volume if the Giant has moved to a new block
         val last = lastTrampleBlockLoc
         if (last != null && last.blockX == center.x && last.blockY == center.y && last.blockZ == center.z) {
             return
         }
         lastTrampleBlockLoc = center.location
 
-        // Crush leaves and foliage in body height
         for (x in -2..2) {
             for (z in -2..2) {
                 for (y in 0..10) {
@@ -294,76 +252,6 @@ class ActiveGiantFight(
                 type == Material.SWEET_BERRY_BUSH
     }
 
-    // ========================================================================
-    // EARTHQUAKE JUMP & GROUND SLAM (2 HEARTS UNBLOCKABLE AOE)
-    // ========================================================================
-
-    private fun performEarthquakeJump(target: LivingEntity) {
-        val dir = target.location.toVector().subtract(giant.location.toVector()).setY(0.0)
-        if (dir.lengthSquared() > 1e-4) dir.normalize()
-
-        world.playSound(giant.location, Sound.ENTITY_ZOMBIE_INFECT, SoundCategory.HOSTILE, 3.0f, 0.5f)
-        world.spawnParticle(Particle.DUST_PLUME, giant.location, 40, 1.5, 0.2, 1.5, 0.08)
-
-        giant.velocity = Vector(dir.x * 0.85, 1.15, dir.z * 0.85)
-        wasAirborneForSlam = true
-    }
-
-    private fun triggerEarthquakeSlam() {
-        val origin = giant.location.clone()
-        val groundData = origin.clone().subtract(0.0, 1.0, 0.0).block.type
-            .takeIf { it.isSolid }?.createBlockData() ?: Material.DIRT.createBlockData()
-
-        world.playSound(origin, Sound.ITEM_MACE_SMASH_GROUND_HEAVY, SoundCategory.HOSTILE, 4.0f, 0.75f)
-        world.playSound(origin, Sound.ITEM_MACE_SMASH_GROUND, SoundCategory.HOSTILE, 4.0f, 0.6f)
-        world.playSound(origin, Sound.ENTITY_GENERIC_EXPLODE, SoundCategory.HOSTILE, 2.5f, 0.5f)
-
-        world.spawnParticle(Particle.GUST_EMITTER_LARGE, origin.clone().add(0.0, 0.5, 0.0), 4, 1.5, 0.2, 1.5, 0.0)
-        world.spawnParticle(Particle.DUST_PLUME, origin.clone().add(0.0, 0.2, 0.0), 120, 3.5, 0.3, 3.5, 0.08)
-
-        val maxRadius = config.earthquakeRadius
-        for (wave in 1..4) {
-            val radius = (maxRadius / 4.0) * wave
-            runLater((wave * 2).toLong()) {
-                val points = (radius * 10).toInt().coerceAtLeast(16)
-                for (i in 0 until points) {
-                    val angle = 2.0 * Math.PI * i / points
-                    val pt = origin.clone().add(cos(angle) * radius, 0.25, sin(angle) * radius)
-                    world.spawnParticle(Particle.BLOCK, pt, 8, 0.25, 0.2, 0.25, 0.1, groundData)
-                    if (i % 3 == 0) {
-                        world.spawnParticle(Particle.GUST, pt.clone().add(0.0, 0.3, 0.0), 1, 0.1, 0.1, 0.1, 0.0)
-                    }
-                    world.spawnParticle(Particle.DUST_PLUME, pt, 2, 0.2, 0.1, 0.2, 0.02)
-                }
-            }
-        }
-
-        // Deal 2 hearts (4.0 HP) of unblockable, armor-ignoring damage in an 8-block circular radius
-        val radiusSq = maxRadius * maxRadius
-        val unblockableSource = DamageSource.builder(DamageType.SONIC_BOOM)
-            .withCausingEntity(giant)
-            .withDirectEntity(giant)
-            .build()
-
-        origin.getNearbyLivingEntities(maxRadius, 5.0, maxRadius).forEach { entity ->
-            if (entity == giant) return@forEach
-            if (entity.persistentDataContainer.has(MobKeys.GIANT_MINION, PersistentDataType.BYTE)) return@forEach
-
-            val dx = entity.location.x - origin.x
-            val dz = entity.location.z - origin.z
-            if ((dx * dx + dz * dz) <= radiusSq) {
-                entity.damage(config.earthquakeDamage, unblockableSource)
-                val pushDir = entity.location.toVector().subtract(origin.toVector()).setY(0.0)
-                if (pushDir.lengthSquared() > 1e-4) pushDir.normalize()
-                entity.velocity = entity.velocity.add(pushDir.multiply(0.6).setY(0.45))
-            }
-        }
-    }
-
-    // ========================================================================
-    // BLOODY FLESH DEATH ANIMATION & RANDOMIZED ZOMBIE BURST
-    // ========================================================================
-
     fun triggerBloodyDeathAnimation() {
         if (isDying) return
         isDying = true
@@ -382,18 +270,23 @@ class ActiveGiantFight(
         val rottenFleshStack = ItemStack(Material.ROTTEN_FLESH)
         val boneStack = ItemStack(Material.BONE)
 
-        world.playSound(giant.location, Sound.ENTITY_ZOMBIE_DEATH, SoundCategory.HOSTILE, 4.0f, 0.5f)
+        var lastBaseLoc = giant.location.clone()
+        world.playSound(lastBaseLoc, Sound.ENTITY_ZOMBIE_DEATH, SoundCategory.HOSTILE, 4.0f, 0.5f)
 
-        // 30-Tick (1.5s) Convulsing Blood & Gore Buildup
         var tick = 0
         var deathTask: BukkitTask? = null
         deathTask = Bukkit.getScheduler().runTaskTimer(plugin, Runnable {
             tick++
-            if (!giant.isValid || tick > 30) {
+            if (!giant.isValid || tick >= 30) {
                 deathTask?.cancel()
+                if (giant.isValid) {
+                    lastBaseLoc = giant.location.clone()
+                }
+                detonateGoreClimax(lastBaseLoc, bloodBlockData, fleshBlockData, goreBlockData, rottenFleshStack, boneStack)
                 return@Runnable
             }
 
+            lastBaseLoc = giant.location.clone()
             val bodyLoc = giant.location.add(0.0, Random.nextDouble(2.0, 9.0), 0.0)
             giant.setRotation(giant.yaw + Random.nextFloat() * 30f - 15f, Random.nextFloat() * 30f - 15f)
 
@@ -405,12 +298,6 @@ class ActiveGiantFight(
             if (tick % 5 == 0) {
                 world.playSound(bodyLoc, Sound.BLOCK_HONEY_BLOCK_BREAK, SoundCategory.HOSTILE, 3.0f, 0.5f)
                 world.playSound(bodyLoc, Sound.ENTITY_WARDEN_DIG, SoundCategory.HOSTILE, 3.0f, 0.8f)
-            }
-
-            // Climax at tick 30: Violent Flesh Rupture + Zombie Burst + Loot & 50 Levels EXP
-            if (tick == 30) {
-                deathTask?.cancel()
-                detonateGoreClimax(giant.location.clone(), bloodBlockData, fleshBlockData, goreBlockData, rottenFleshStack, boneStack)
             }
         }, 1L, 1L)
     }
@@ -441,7 +328,6 @@ class ActiveGiantFight(
 
         spawnZombieBurst(torsoLoc, bloodData)
 
-        // Drops 128 Rotten Flesh & 64 Bones
         val drops = listOf(
             ItemStack(Material.ROTTEN_FLESH, 64),
             ItemStack(Material.ROTTEN_FLESH, 64),
@@ -451,7 +337,6 @@ class ActiveGiantFight(
             world.dropItemNaturally(torsoLoc, stack)
         }
 
-        // Drops configured 50 Levels of Experience (5,345 XP)
         ExperienceUtil.spawnLevelOrbs(torsoLoc, config.expLevelsDropped, orbCount = 15)
 
         val id = giant.uniqueId
@@ -492,10 +377,6 @@ class ActiveGiantFight(
         }
     }
 
-    // ========================================================================
-    // CLEANUP & HELPERS
-    // ========================================================================
-
     fun onDeath() {
         forceCleanup(killGiant = false)
     }
@@ -526,12 +407,6 @@ class ActiveGiantFight(
 
     private fun isValidPlayer(player: Player): Boolean {
         return !player.isDead && (player.gameMode == GameMode.SURVIVAL || player.gameMode == GameMode.ADVENTURE)
-    }
-
-    private fun runLater(delay: Long, action: () -> Unit): BukkitTask {
-        val task = Bukkit.getScheduler().runTaskLater(plugin, Runnable(action), delay)
-        tasks.add(task)
-        return task
     }
 
     private fun runTimer(delay: Long, period: Long, action: () -> Unit): BukkitTask {
